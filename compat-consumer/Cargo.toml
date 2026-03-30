@@ -1,0 +1,11 @@
+[package]
+name = "compat-consumer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# TODO: once the crates are published, replace the path dependencies.
+ingest = { package = "opendata-ingest", path = "../../opendata/ingest" }
+common = { package = "opendata-common", path = "../../opendata/common" }
+tokio = { version = "1", features = ["full"] }
+bytes = "1"

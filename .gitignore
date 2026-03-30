@@ -21,5 +21,11 @@ go.work.sum
 *.swp
 *.swo
 
+# Build output
+bin/
+
+# Rust compat-consumer
+compat-consumer/target/
+
 # OS
 .DS_Store
