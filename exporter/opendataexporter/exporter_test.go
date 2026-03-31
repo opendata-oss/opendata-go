@@ -3,6 +3,7 @@ package opendataexporter
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -112,7 +113,7 @@ func TestOpenDataExporterConsumeMetricsBeforeStart(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if err != errExporterNotStarted {
+	if !errors.Is(err, errExporterNotStarted) {
 		t.Fatalf("expected %v, got %v", errExporterNotStarted, err)
 	}
 }

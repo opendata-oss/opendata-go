@@ -1,7 +1,7 @@
 // compat-consumer reads batches produced by the Go compat-producer and
 // verifies the data matches expectations.
 //
-// It connects to an S3-compatible store (MinIO), reads all queued batches
+// It connects to an S3-compatible store (MinIO in CI), reads all queued batches
 // via the Rust Collector, and asserts that the entries match what the Go
 // producer wrote.
 

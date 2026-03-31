@@ -1,0 +1,27 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: {{ printf "%q" .ReceiverEndpoint }}
+
+exporters:
+  opendata:
+    object_store:
+      type: s3
+      bucket: {{ printf "%q" .Bucket }}
+      region: {{ printf "%q" .Region }}
+      endpoint: {{ printf "%q" .S3Endpoint }}
+    data_path_prefix: {{ printf "%q" .DataPathPrefix }}
+    manifest_path: {{ printf "%q" .ManifestPath }}
+    flush_interval: 1s
+    flush_size_bytes: 1
+    compression: {{ printf "%q" .Compression }}
+
+service:
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      exporters: [opendata]
