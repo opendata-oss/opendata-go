@@ -4,9 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# TODO: once the crates are published, replace the path dependencies.
-# Uses collector_batch_metadata branch for Metadata on CollectedBatch.
-ingest = { package = "opendata-ingest", path = "../../opendata/ingest" }
-common = { package = "opendata-common", path = "../../opendata/common" }
+ingest = { package = "opendata-ingest", version = "0.1.3" }
+common = { package = "opendata-common", version = "0.1.12" }
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
