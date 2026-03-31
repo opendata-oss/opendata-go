@@ -24,8 +24,8 @@ go.work.sum
 # Build output
 bin/
 
-# Rust compat-consumer
-compat-consumer/target/
+# Rust build output
+**/target/
 
 # OS
 .DS_Store

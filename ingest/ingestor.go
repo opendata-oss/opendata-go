@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/oklog/ulid/v2"
-	"github.com/opendata-oss/ingest-go/objstore"
+	"github.com/opendata-oss/opendata-go/objstore"
 )
 
 // DurabilityWatcher allows callers to check or wait for a batch to be durably flushed.

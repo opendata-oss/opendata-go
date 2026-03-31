@@ -12,7 +12,7 @@ use bytes::Bytes;
 
 use common::ObjectStoreConfig;
 use common::storage::config::AwsObjectStoreConfig;
-use ingest::{CollectorConfig, Collector};
+use ingest::{Collector, CollectorConfig};
 
 #[tokio::main]
 async fn main() {
@@ -37,10 +37,10 @@ async fn main() {
         .expect("failed to initialize collector");
 
     // Expected batches from the Go producer.
-    let expected: Vec<Vec<&str>> = vec![
-        vec!["hello", "world"],
-        vec!["foo", "bar", "baz"],
-        vec!["single-entry"],
+    let expected: Vec<(Vec<&str>, &str)> = vec![
+        (vec!["hello", "world"], r#"{"batch":1}"#),
+        (vec!["foo", "bar", "baz"], r#"{"batch":2}"#),
+        (vec!["single-entry"], r#"{"batch":3}"#),
     ];
 
     let mut batch_idx = 0;
@@ -52,17 +52,44 @@ async fn main() {
                     process::exit(1);
                 }
 
-                let expected_entries: Vec<Bytes> = expected[batch_idx]
+                let (ref expected_strs, expected_meta) = expected[batch_idx];
+                let expected_entries: Vec<Bytes> = expected_strs
                     .iter()
                     .map(|s| Bytes::from(*s))
                     .collect();
 
                 if batch.entries != expected_entries {
                     eprintln!(
-                        "ERROR: batch {} mismatch\n  expected: {:?}\n  actual:   {:?}",
+                        "ERROR: batch {} entries mismatch\n  expected: {:?}\n  actual:   {:?}",
                         batch_idx + 1,
                         expected_entries,
                         batch.entries
+                    );
+                    process::exit(1);
+                }
+
+                if batch.metadata.len() != 1 {
+                    eprintln!(
+                        "ERROR: batch {} expected 1 metadata range, got {}",
+                        batch_idx + 1,
+                        batch.metadata.len()
+                    );
+                    process::exit(1);
+                }
+                if batch.metadata[0].start_index != 0 {
+                    eprintln!(
+                        "ERROR: batch {} metadata start_index: expected 0, got {}",
+                        batch_idx + 1,
+                        batch.metadata[0].start_index
+                    );
+                    process::exit(1);
+                }
+                if batch.metadata[0].payload != Bytes::from(expected_meta) {
+                    eprintln!(
+                        "ERROR: batch {} metadata payload mismatch\n  expected: {:?}\n  actual:   {:?}",
+                        batch_idx + 1,
+                        expected_meta,
+                        batch.metadata[0].payload
                     );
                     process::exit(1);
                 }

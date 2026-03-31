@@ -1,4 +1,4 @@
-module github.com/opendata-oss/ingest-go
+module github.com/opendata-oss/opendata-go
 
 go 1.26.1
 

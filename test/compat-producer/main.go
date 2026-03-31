@@ -13,8 +13,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
-	ingest "github.com/opendata-oss/ingest-go"
-	"github.com/opendata-oss/ingest-go/objstore"
+	"github.com/opendata-oss/opendata-go/ingest"
+	"github.com/opendata-oss/opendata-go/objstore"
 )
 
 func main() {

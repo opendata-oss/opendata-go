@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/opendata-oss/ingest-go/objstore"
+	"github.com/opendata-oss/opendata-go/objstore"
 )
 
 func testConfig() IngestorConfig {

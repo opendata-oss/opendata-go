@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"sync/atomic"
 
-	"github.com/opendata-oss/ingest-go/objstore"
+	"github.com/opendata-oss/opendata-go/objstore"
 )
 
 // Manifest binary format constants.
