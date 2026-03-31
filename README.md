@@ -12,3 +12,11 @@ Go bindings for the [OpenData](https://github.com/opendata-oss/opendata) project
 | [`ingest`](ingest/) | Stateless ingestion library |
 | [`objstore`](objstore/) | Object storage abstraction with S3 and in-memory implementations. |
 
+## Releases
+
+This repository publishes Go modules by git tag rather than shipping prebuilt collector binaries.
+
+- Root module tags use `vX.Y.Z`
+- Exporter module tags use `exporter/opendataexporter/vX.Y.Z`
+
+Release details are documented in [`RELEASE.md`](RELEASE.md).
