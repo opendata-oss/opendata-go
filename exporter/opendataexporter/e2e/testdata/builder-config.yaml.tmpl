@@ -1,0 +1,21 @@
+dist:
+  module: github.com/opendata-oss/opendata-go/exporter/opendataexporter/e2e/otelcol
+  name: otelcol-opendata-e2e
+  description: OpenData exporter end-to-end collector
+  output_path: {{ printf "%q" .OutputPath }}
+  otelcol_version: 0.149.0
+exporters:
+  - gomod: github.com/opendata-oss/opendata-go/exporter/opendataexporter v0.0.0
+    import: github.com/opendata-oss/opendata-go/exporter/opendataexporter
+    path: {{ printf "%q" .ExporterModuleDir }}
+receivers:
+  - gomod: go.opentelemetry.io/collector/receiver/otlpreceiver v0.149.0
+providers:
+  - gomod: go.opentelemetry.io/collector/confmap/provider/envprovider v1.55.0
+  - gomod: go.opentelemetry.io/collector/confmap/provider/fileprovider v1.55.0
+  - gomod: go.opentelemetry.io/collector/confmap/provider/yamlprovider v1.55.0
+telemetry:
+  gomod: go.opentelemetry.io/collector/service v0.149.0
+  import: go.opentelemetry.io/collector/service/telemetry/otelconftelemetry
+replaces:
+  - {{ printf "%q" (printf "github.com/opendata-oss/opendata-go => %s" .RepoRootDir) }}

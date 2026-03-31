@@ -76,3 +76,23 @@ jobs:
         with:
           workspaces: test/compat-consumer
       - run: ./scripts/compat-test.sh
+
+  exporter-e2e:
+    name: Exporter E2E
+    runs-on: ubuntu-latest
+    steps:
+      - uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          docker-images: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: exporter/opendataexporter/go.mod
+      - run: go test -tags=e2e -v ./e2e
+        working-directory: exporter/opendataexporter

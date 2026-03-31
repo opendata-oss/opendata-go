@@ -1,4 +1,4 @@
-.PHONY: fmt lint test build check
+.PHONY: fmt lint test exporter-e2e compat-test build check
 
 EXPORTER_MODULE := exporter/opendataexporter
 ROOT_GO_FILES := $(shell find . -name '*.go' -not -path './$(EXPORTER_MODULE)/*' -not -path './.git/*')
@@ -19,6 +19,12 @@ lint:
 test:
 	go test -race $(ROOT_GO_PACKAGES)
 	$(MAKE) -C $(EXPORTER_MODULE) test
+
+exporter-e2e:
+	$(MAKE) -C $(EXPORTER_MODULE) e2e
+
+compat-test:
+	./scripts/compat-test.sh
 
 # Build all packages
 build:

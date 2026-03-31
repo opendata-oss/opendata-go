@@ -1,4 +1,4 @@
-.PHONY: fmt lint test build check
+.PHONY: fmt lint test e2e build check
 
 fmt:
 	goimports -w .
@@ -9,6 +9,9 @@ lint:
 
 test:
 	go test -race ./...
+
+e2e:
+	go test -tags=e2e -v ./e2e
 
 build:
 	go build ./...

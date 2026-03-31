@@ -18,19 +18,23 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+CACHE_DIR="${TMPDIR:-/tmp}/opendata-compat-cache"
 
 # ---------- configuration ----------
 MINIO_CONTAINER="ingest-compat-minio"
 MINIO_PORT="${MINIO_PORT:-9000}"
-MINIO_CONSOLE_PORT="${MINIO_CONSOLE_PORT:-9001}"
+MINIO_IMAGE="${MINIO_IMAGE:-minio/minio:RELEASE.2025-09-07T16-13-09Z}"
 S3_ENDPOINT="http://localhost:${MINIO_PORT}"
 S3_BUCKET="compat-test"
-AWS_ACCESS_KEY_ID="minioadmin"
-AWS_SECRET_ACCESS_KEY="minioadmin"
+AWS_ACCESS_KEY_ID="test"
+AWS_SECRET_ACCESS_KEY="testtesttest"
 AWS_REGION="us-east-1"
 BATCH_COMPRESSION="${BATCH_COMPRESSION:-none}"
 
 export S3_ENDPOINT S3_BUCKET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION BATCH_COMPRESSION
+export GOCACHE="${GOCACHE:-${CACHE_DIR}/gocache}"
+export GOMODCACHE="${GOMODCACHE:-${CACHE_DIR}/gomodcache}"
+export GOPATH="${GOPATH:-${CACHE_DIR}/gopath}"
 # Rust object_store reads this env var for S3-compatible endpoints.
 export AWS_ENDPOINT_URL="${S3_ENDPOINT}"
 # Rust object_store needs this to skip loading IMDS credentials.
@@ -44,6 +48,8 @@ cleanup() {
 trap cleanup EXIT
 
 log() { echo "=== $* ==="; }
+
+mkdir -p "${GOCACHE}" "${GOMODCACHE}" "${GOPATH}"
 
 wait_for_minio() {
     local attempts=0
@@ -63,22 +69,12 @@ docker rm -f "${MINIO_CONTAINER}" 2>/dev/null || true
 docker run -d \
     --name "${MINIO_CONTAINER}" \
     -p "${MINIO_PORT}:9000" \
-    -p "${MINIO_CONSOLE_PORT}:9001" \
     -e "MINIO_ROOT_USER=${AWS_ACCESS_KEY_ID}" \
     -e "MINIO_ROOT_PASSWORD=${AWS_SECRET_ACCESS_KEY}" \
-    minio/minio:latest server /data --console-address ":9001"
+    "${MINIO_IMAGE}" server /data
 
 log "waiting for MinIO to be healthy"
 wait_for_minio
-
-# ---------- create bucket ----------
-log "creating bucket '${S3_BUCKET}'"
-docker exec "${MINIO_CONTAINER}" \
-    mc alias set local http://localhost:9000 "${AWS_ACCESS_KEY_ID}" "${AWS_SECRET_ACCESS_KEY}" \
-    >/dev/null 2>&1 || true
-docker exec "${MINIO_CONTAINER}" \
-    mc mb "local/${S3_BUCKET}" \
-    >/dev/null 2>&1 || true
 
 # ---------- build ----------
 log "building Go producer"

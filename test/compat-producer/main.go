@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
@@ -20,8 +21,8 @@ import (
 func main() {
 	endpoint := envOrDefault("S3_ENDPOINT", "http://localhost:9000")
 	bucket := envOrDefault("S3_BUCKET", "compat-test")
-	accessKey := envOrDefault("AWS_ACCESS_KEY_ID", "minioadmin")
-	secretKey := envOrDefault("AWS_SECRET_ACCESS_KEY", "minioadmin")
+	accessKey := envOrDefault("AWS_ACCESS_KEY_ID", "test")
+	secretKey := envOrDefault("AWS_SECRET_ACCESS_KEY", "testtesttest")
 	region := envOrDefault("AWS_REGION", "us-east-1")
 
 	ctx := context.Background()
@@ -38,6 +39,10 @@ func main() {
 		o.BaseEndpoint = &endpoint
 		o.UsePathStyle = true
 	})
+
+	if _, err := client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: &bucket}); err != nil && !bucketAlreadyExists(err) {
+		log.Fatalf("create bucket failed: %v", err)
+	}
 
 	store := objstore.NewS3(client, bucket)
 
@@ -102,4 +107,12 @@ func compressionFromEnv() ingest.CompressionType {
 	default:
 		return ingest.CompressionNone
 	}
+}
+
+func bucketAlreadyExists(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "BucketAlreadyOwnedByYou") || strings.Contains(msg, "BucketAlreadyExists")
 }
