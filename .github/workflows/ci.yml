@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v7
+        with:
+          version: latest
+
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./...
+
+  compat-test:
+    name: Compatibility Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          docker-images: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: test/compat-consumer
+      - run: ./scripts/compat-test.sh

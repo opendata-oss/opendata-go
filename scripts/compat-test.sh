@@ -82,10 +82,10 @@ docker exec "${MINIO_CONTAINER}" \
 
 # ---------- build ----------
 log "building Go producer"
-(cd "${PROJECT_DIR}" && go build -o "${PROJECT_DIR}/bin/compat-producer" ./cmd/compat-producer)
+(cd "${PROJECT_DIR}" && go build -o "${PROJECT_DIR}/bin/compat-producer" ./test/compat-producer)
 
 log "building Rust consumer"
-(cd "${PROJECT_DIR}/compat-consumer" && cargo build --release 2>&1)
+(cd "${PROJECT_DIR}/test/compat-consumer" && cargo build 2>&1)
 
 # ---------- run producer ----------
 log "running Go producer (compression=${BATCH_COMPRESSION})"
@@ -93,7 +93,7 @@ log "running Go producer (compression=${BATCH_COMPRESSION})"
 
 # ---------- run consumer ----------
 log "running Rust consumer"
-"${PROJECT_DIR}/compat-consumer/target/release/compat-consumer"
+"${PROJECT_DIR}/test/compat-consumer/target/debug/compat-consumer"
 
 # ---------- done ----------
 log "compatibility test PASSED"

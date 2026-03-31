@@ -23,10 +23,7 @@ async fn main() {
     // and AWS_SECRET_ACCESS_KEY from the environment automatically via
     // AmazonS3Builder::from_env().
     let config = CollectorConfig {
-        object_store: ObjectStoreConfig::Aws(AwsObjectStoreConfig {
-            region,
-            bucket,
-        }),
+        object_store: ObjectStoreConfig::Aws(AwsObjectStoreConfig { region, bucket }),
         manifest_path: "ingest/manifest".to_string(),
     };
 
@@ -53,10 +50,8 @@ async fn main() {
                 }
 
                 let (ref expected_strs, expected_meta) = expected[batch_idx];
-                let expected_entries: Vec<Bytes> = expected_strs
-                    .iter()
-                    .map(|s| Bytes::from(*s))
-                    .collect();
+                let expected_entries: Vec<Bytes> =
+                    expected_strs.iter().map(|s| Bytes::from(*s)).collect();
 
                 if batch.entries != expected_entries {
                     eprintln!(
