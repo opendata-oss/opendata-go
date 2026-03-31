@@ -5,7 +5,7 @@ dist:
   output_path: {{ printf "%q" .OutputPath }}
   otelcol_version: 0.149.0
 exporters:
-  - gomod: github.com/opendata-oss/opendata-go/exporter/opendataexporter v0.0.0
+  - gomod: github.com/opendata-oss/opendata-go/exporter/opendataexporter v0.1.0
     import: github.com/opendata-oss/opendata-go/exporter/opendataexporter
     path: {{ printf "%q" .ExporterModuleDir }}
 receivers:

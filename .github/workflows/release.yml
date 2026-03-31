@@ -1,0 +1,120 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - 'exporter/opendataexporter/v*'
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: Validate Tag
+    runs-on: ubuntu-latest
+    outputs:
+      is_root: ${{ steps.classify.outputs.is_root }}
+      is_exporter: ${{ steps.classify.outputs.is_exporter }}
+      tag_name: ${{ steps.classify.outputs.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - id: classify
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          echo "tag_name=${tag}" >> "${GITHUB_OUTPUT}"
+          case "${tag}" in
+            v*)
+              echo "is_root=true" >> "${GITHUB_OUTPUT}"
+              echo "is_exporter=false" >> "${GITHUB_OUTPUT}"
+              ;;
+            exporter/opendataexporter/v*)
+              echo "is_root=false" >> "${GITHUB_OUTPUT}"
+              echo "is_exporter=true" >> "${GITHUB_OUTPUT}"
+              ;;
+            *)
+              echo "unexpected tag format: ${tag}" >&2
+              exit 1
+              ;;
+          esac
+      - run: ./scripts/validate-release-tag.sh "${GITHUB_REF_NAME}"
+
+  root-tests:
+    name: Root Release Tests
+    needs: validate
+    if: needs.validate.outputs.is_root == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          docker-images: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v7
+        with:
+          version: latest
+          args: ./ingest ./objstore ./test/compat-producer
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: test/compat-consumer
+      - run: go test -race ./ingest ./objstore ./test/compat-producer
+      - run: ./scripts/compat-test.sh
+
+  exporter-tests:
+    name: Exporter Release Tests
+    needs: validate
+    if: needs.validate.outputs.is_exporter == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          docker-images: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: false
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: exporter/opendataexporter/go.mod
+      - uses: golangci/golangci-lint-action@v7
+        with:
+          version: latest
+          working-directory: exporter/opendataexporter
+          args: ./...
+      - run: go test -race ./...
+        working-directory: exporter/opendataexporter
+      - run: go test -tags=e2e -v ./e2e
+        working-directory: exporter/opendataexporter
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - validate
+      - root-tests
+      - exporter-tests
+    if: always() && needs.validate.result == 'success' && (needs.root-tests.result == 'success' || needs.root-tests.result == 'skipped') && (needs.exporter-tests.result == 'success' || needs.exporter-tests.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          name: ${{ needs.validate.outputs.tag_name }}
