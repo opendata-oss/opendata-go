@@ -10,24 +10,49 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: Root Module
+            module: .
+            go_version_file: go.mod
+            targets: ./ingest ./objstore ./test/compat-producer
+          - name: Exporter Module
+            module: exporter/opendataexporter
+            go_version_file: exporter/opendataexporter/go.mod
+            targets: ./...
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version-file: ${{ matrix.go_version_file }}
       - uses: golangci/golangci-lint-action@v7
         with:
           version: latest
+          working-directory: ${{ matrix.module }}
+          args: ${{ matrix.targets }}
 
   test:
     name: Unit Tests
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: Root Module
+            module: .
+            go_version_file: go.mod
+            targets: ./ingest ./objstore ./test/compat-producer
+          - name: Exporter Module
+            module: exporter/opendataexporter
+            go_version_file: exporter/opendataexporter/go.mod
+            targets: ./...
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
-      - run: go test -race ./...
+          go-version-file: ${{ matrix.go_version_file }}
+      - run: go test -race ${{ matrix.targets }}
+        working-directory: ${{ matrix.module }}
 
   compat-test:
     name: Compatibility Test
