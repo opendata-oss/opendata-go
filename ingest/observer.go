@@ -6,9 +6,13 @@ import "time"
 type FlushReason string
 
 const (
-	FlushReasonSize     FlushReason = "size"
-	FlushReasonTime     FlushReason = "time"
-	FlushReasonManual   FlushReason = "manual"
+	// FlushReasonSize indicates that the batch flushed after reaching the size threshold.
+	FlushReasonSize FlushReason = "size"
+	// FlushReasonTime indicates that the batch flushed after reaching the time threshold.
+	FlushReasonTime FlushReason = "time"
+	// FlushReasonManual indicates that the batch flushed due to an explicit flush request.
+	FlushReasonManual FlushReason = "manual"
+	// FlushReasonShutdown indicates that the batch flushed during ingestor shutdown.
 	FlushReasonShutdown FlushReason = "shutdown"
 )
 
