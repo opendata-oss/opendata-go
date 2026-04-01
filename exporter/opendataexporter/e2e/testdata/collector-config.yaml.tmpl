@@ -21,6 +21,14 @@ service:
   telemetry:
     logs:
       level: info
+    metrics:
+      level: detailed
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: "127.0.0.1"
+                port: {{ .TelemetryPort }}
   pipelines:
     metrics:
       receivers: [otlp]

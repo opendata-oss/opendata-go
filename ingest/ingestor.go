@@ -119,6 +119,15 @@ func (b *batchAccumulator) reset() ([][]byte, []QueueMetadata, []*DurabilityWatc
 	return entries, metadata, watchers
 }
 
+func (b *batchAccumulator) stats() FlushStats {
+	return FlushStats{
+		Inputs:            len(b.metadata),
+		Entries:           len(b.entries),
+		UncompressedBytes: b.sizeBytes,
+		Age:               time.Since(b.startedAt),
+	}
+}
+
 // Ingestor accepts opaque byte entries, batches them, and flushes to object
 // storage on size or time thresholds.
 type Ingestor struct {
@@ -180,19 +189,19 @@ func (ing *Ingestor) run() {
 		case msg, ok := <-ing.ingestCh:
 			if !ok {
 				// Channel closed — flush remaining and exit.
-				_ = ing.writeBatch(batch)
+				_ = ing.writeBatch(batch, FlushReasonShutdown)
 				return
 			}
 			batch.add(msg)
 			if batch.sizeBytes >= ing.config.FlushSizeBytes {
-				_ = ing.writeBatch(batch)
+				_ = ing.writeBatch(batch, FlushReasonSize)
 			}
 		case fm := <-ing.flushCh:
 			// Drain any pending ingest messages before flushing.
 			ing.drainIngestCh(batch)
-			fm.result <- ing.writeBatch(batch)
+			fm.result <- ing.writeBatch(batch, FlushReasonManual)
 		case <-timerCh:
-			_ = ing.writeBatch(batch)
+			_ = ing.writeBatch(batch, FlushReasonTime)
 		}
 	}
 }
@@ -211,13 +220,18 @@ func (ing *Ingestor) drainIngestCh(batch *batchAccumulator) {
 	}
 }
 
-func (ing *Ingestor) writeBatch(batch *batchAccumulator) error {
+func (ing *Ingestor) writeBatch(batch *batchAccumulator, reason FlushReason) error {
 	if batch.isEmpty() {
 		return nil
 	}
 
+	stats := batch.stats()
+	start := time.Now()
 	entries, metadata, watchers := batch.reset()
 	err := ing.writeAndEnqueue(entries, metadata)
+	if ing.config.Observer != nil {
+		ing.config.Observer.OnFlush(reason, stats, time.Since(start), err)
+	}
 	for _, w := range watchers {
 		w.resolve(err)
 	}
@@ -234,11 +248,23 @@ func (ing *Ingestor) writeAndEnqueue(entries [][]byte, metadata []QueueMetadata)
 	path := fmt.Sprintf("%s/%s.batch", ing.config.DataPathPrefix, id.String())
 
 	ctx := context.Background()
+	putStart := time.Now()
 	if err := ing.store.Put(ctx, path, payload); err != nil {
+		if ing.config.Observer != nil {
+			ing.config.Observer.OnStorePut(len(payload), time.Since(putStart), err)
+		}
 		return storageErr(err.Error())
 	}
+	if ing.config.Observer != nil {
+		ing.config.Observer.OnStorePut(len(payload), time.Since(putStart), nil)
+	}
 
-	return ing.producer.enqueue(ctx, path, metadata)
+	manifestStart := time.Now()
+	conflicts, err := ing.producer.enqueue(ctx, path, metadata)
+	if ing.config.Observer != nil {
+		ing.config.Observer.OnManifestEnqueue(len(metadata), time.Since(manifestStart), conflicts, err)
+	}
+	return err
 }
 
 // Ingest submits entries and associated metadata for ingestion.
@@ -262,6 +288,9 @@ func (ing *Ingestor) Ingest(entries [][]byte, metadata []byte) (*WriteHandle, er
 
 	select {
 	case ing.ingestCh <- msg:
+		if ing.config.Observer != nil {
+			ing.config.Observer.OnAccepted()
+		}
 		return &WriteHandle{Watcher: watcher}, nil
 	case <-ing.done:
 		return nil, ErrShutdown

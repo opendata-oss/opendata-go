@@ -7,11 +7,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"text/template"
@@ -71,8 +74,10 @@ func TestCollectorExportsMetricsToS3CompatibleStorage(t *testing.T) {
 			dataPathPrefix := fmt.Sprintf("ingest/otel/e2e/%s/data", tc.name)
 			manifestPath := fmt.Sprintf("ingest/otel/e2e/%s/manifest", tc.name)
 			receiverPort := freeTCPPort(t)
+			telemetryPort := freeTCPPort(t)
 			configPath := writeCollectorConfig(t, filepath.Join(buildDir, tc.name+".yaml"), collectorConfigTemplateData{
 				ReceiverEndpoint: fmt.Sprintf("127.0.0.1:%d", receiverPort),
+				TelemetryPort:    telemetryPort,
 				S3Endpoint:       minio.exporterEndpoint,
 				Bucket:           bucket,
 				Region:           awsRegion,
@@ -81,12 +86,13 @@ func TestCollectorExportsMetricsToS3CompatibleStorage(t *testing.T) {
 				Compression:      tc.compression,
 			})
 
-			collector := startCollector(t, collectorBinary, configPath, receiverPort)
+			collector := startCollector(t, collectorBinary, configPath, receiverPort, telemetryPort)
 			defer collector.stop(t)
 
 			original := testMetrics(tc.name)
 			exportMetrics(t, receiverPort, original)
 			verifyExportedMetrics(t, verifierClient, bucket, manifestPath, dataPathPrefix, original)
+			verifyExporterSelfMetrics(t, telemetryPort)
 		})
 	}
 }
@@ -195,7 +201,7 @@ type collectorProcess struct {
 	done chan error
 }
 
-func startCollector(t *testing.T, binaryPath, configPath string, receiverPort int) *collectorProcess {
+func startCollector(t *testing.T, binaryPath, configPath string, receiverPort, telemetryPort int) *collectorProcess {
 	t.Helper()
 
 	cmd := exec.Command(binaryPath, "--config", configPath)
@@ -217,7 +223,7 @@ func startCollector(t *testing.T, binaryPath, configPath string, receiverPort in
 		proc.done <- cmd.Wait()
 	}()
 
-	waitForGRPCReady(t, proc, receiverPort)
+	waitForCollectorReady(t, proc, receiverPort, telemetryPort)
 	return proc
 }
 
@@ -366,21 +372,12 @@ func waitForHTTPReady(t *testing.T, url string) {
 	}
 }
 
-func waitForGRPCReady(t *testing.T, proc *collectorProcess, receiverPort int) {
+func waitForCollectorReady(t *testing.T, proc *collectorProcess, receiverPort, telemetryPort int) {
 	t.Helper()
 
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		conn, err := grpc.DialContext(
-			ctx,
-			fmt.Sprintf("127.0.0.1:%d", receiverPort),
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithBlock(),
-		)
-		cancel()
-		if err == nil {
-			_ = conn.Close()
+		if grpcReady(receiverPort) && metricsReady(telemetryPort) {
 			return
 		}
 
@@ -395,6 +392,95 @@ func waitForGRPCReady(t *testing.T, proc *collectorProcess, receiverPort int) {
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
+}
+
+func grpcReady(receiverPort int) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	conn, err := grpc.DialContext(
+		ctx,
+		fmt.Sprintf("127.0.0.1:%d", receiverPort),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(),
+	)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+func metricsReady(telemetryPort int) bool {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", telemetryPort))
+	if err != nil {
+		return false
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+	return resp.StatusCode == http.StatusOK
+}
+
+func verifyExporterSelfMetrics(t *testing.T, telemetryPort int) {
+	t.Helper()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		body := fetchMetricsPage(t, telemetryPort)
+		if metricValue(body, "opendataexporter_requests_total") > 0 &&
+			metricValue(body, "opendataexporter_metrics_received_total") > 0 &&
+			metricValue(body, "opendataexporter_data_points_received_total") > 0 &&
+			metricValue(body, "opendataexporter_durable_wait_duration_seconds_count") > 0 &&
+			metricValue(body, "opendataexporter_flush_duration_seconds_count") > 0 &&
+			metricValue(body, "opendataexporter_manifest_enqueue_duration_seconds_count") > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for exporter self-metrics on :%d\n%s", telemetryPort, body)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+func metricValue(body, name string) float64 {
+	for _, line := range strings.Split(body, "\n") {
+		if line == "" || strings.HasPrefix(line, "#") || !strings.HasPrefix(line, name) {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		value, err := strconv.ParseFloat(fields[len(fields)-1], 64)
+		if err != nil || math.IsNaN(value) {
+			continue
+		}
+		return value
+	}
+	return 0
+}
+
+func fetchMetricsPage(t *testing.T, telemetryPort int) string {
+	t.Helper()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", telemetryPort))
+	if err != nil {
+		t.Fatalf("fetch collector telemetry metrics: %v", err)
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("fetch collector telemetry metrics: unexpected status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read collector telemetry metrics: %v", err)
+	}
+	return string(body)
 }
 
 func createBucket(t *testing.T, ctx context.Context, client *s3.Client, bucket string) {
@@ -467,6 +553,7 @@ func writeBuilderConfig(t *testing.T, path string, data builderConfigTemplateDat
 
 type collectorConfigTemplateData struct {
 	ReceiverEndpoint string
+	TelemetryPort    int
 	S3Endpoint       string
 	Bucket           string
 	Region           string
