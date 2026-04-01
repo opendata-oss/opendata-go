@@ -30,6 +30,9 @@ func createDefaultConfig() component.Config {
 	}
 }
 
-func createMetricsExporter(_ context.Context, _ exporter.Settings, cfg component.Config) (exporter.Metrics, error) {
-	return newOpenDataExporter(cfg.(*Config)), nil
+func createMetricsExporter(_ context.Context, set exporter.Settings, cfg component.Config) (exporter.Metrics, error) {
+	return newOpenDataExporterWithTelemetry(cfg.(*Config), componentTelemetrySettings{
+		logger:        set.Logger,
+		meterProvider: set.MeterProvider,
+	})
 }

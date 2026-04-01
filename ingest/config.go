@@ -32,6 +32,9 @@ type IngestorConfig struct {
 
 	// BatchCompression is the compression algorithm for data batches.
 	BatchCompression CompressionType
+
+	// Observer receives lifecycle events from the ingestor.
+	Observer Observer
 }
 
 // DefaultIngestorConfig returns an IngestorConfig with sensible defaults.

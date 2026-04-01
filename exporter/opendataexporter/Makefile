@@ -5,7 +5,7 @@ fmt:
 	gofmt -w .
 
 lint:
-	golangci-lint run ./...
+	golangci-lint run .
 
 test:
 	go test -race ./...

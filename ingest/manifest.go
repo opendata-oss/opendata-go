@@ -300,34 +300,36 @@ func newQueueProducer(store objstore.ObjectStore, manifestPath string) *queuePro
 
 // enqueue appends a queue entry to the manifest. Retries automatically on
 // optimistic concurrency conflicts.
-func (p *queueProducer) enqueue(ctx context.Context, location string, metadata []QueueMetadata) error {
+func (p *queueProducer) enqueue(ctx context.Context, location string, metadata []QueueMetadata) (int, error) {
 	entry := &QueueEntry{Location: location, Metadata: metadata}
+	conflicts := 0
 
 	for {
 		m, version, err := p.readManifest(ctx)
 		if err != nil {
-			return err
+			return conflicts, err
 		}
 
 		if err := m.append(entry); err != nil {
-			return err
+			return conflicts, err
 		}
 
 		data, err := m.toBytes()
 		if err != nil {
-			return err
+			return conflicts, err
 		}
 
 		p.counter.recordWrite()
 		err = p.store.PutIfMatch(ctx, p.manifestPath, data, version)
 		if err == nil {
-			return nil
+			return conflicts, nil
 		}
 		if errors.Is(err, objstore.ErrPreconditionFailed) {
 			p.counter.recordConflict()
+			conflicts++
 			continue
 		}
-		return storageErr(err.Error())
+		return conflicts, storageErr(err.Error())
 	}
 }
 
