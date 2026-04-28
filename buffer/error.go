@@ -1,4 +1,4 @@
-package ingest
+package buffer
 
 import (
 	"errors"
@@ -18,8 +18,8 @@ var (
 	// ErrFenced indicates that another consumer has taken over (epoch mismatch).
 	ErrFenced = errors.New("consumer fenced: epoch mismatch")
 
-	// ErrShutdown indicates the ingestor has been shut down.
-	ErrShutdown = errors.New("ingestor shut down")
+	// ErrShutdown indicates the buffer has been shut down.
+	ErrShutdown = errors.New("buffer shut down")
 )
 
 func storageErr(msg string) error {

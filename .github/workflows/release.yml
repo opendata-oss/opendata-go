@@ -66,12 +66,12 @@ jobs:
       - uses: golangci/golangci-lint-action@v7
         with:
           version: latest
-          args: ./ingest ./objstore ./test/compat-producer
+          args: ./buffer ./objstore ./test/compat-producer
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: test/compat-consumer
-      - run: go test -race ./ingest ./objstore ./test/compat-producer
+      - run: go test -race ./buffer ./objstore ./test/compat-producer
       - run: ./scripts/compat-test.sh
 
   exporter-tests:

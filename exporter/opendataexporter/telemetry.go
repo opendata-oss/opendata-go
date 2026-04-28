@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/opendata-oss/opendata-go/ingest"
+	"github.com/opendata-oss/opendata-go/buffer"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
@@ -99,7 +99,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 	enqueueWaitDuration, err := meter.Float64Histogram(
 		"opendataexporter.enqueue_wait_duration_seconds",
 		metric.WithUnit("s"),
-		metric.WithDescription("Time spent waiting to hand a payload to the ingestor."),
+		metric.WithDescription("Time spent waiting to hand a payload to the buffer."),
 	)
 	if err != nil {
 		return nil, err
@@ -121,7 +121,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 	}
 	flushesTotal, err := meter.Int64Counter(
 		"opendataexporter.flushes_total",
-		metric.WithDescription("Number of ingestor flush attempts."),
+		metric.WithDescription("Number of buffer flush attempts."),
 	)
 	if err != nil {
 		return nil, err
@@ -278,7 +278,7 @@ func (t *exporterTelemetry) OnAccepted() {
 	t.pendingInputs.Add(context.Background(), 1)
 }
 
-func (t *exporterTelemetry) OnFlush(reason ingest.FlushReason, stats ingest.FlushStats, duration time.Duration, err error) {
+func (t *exporterTelemetry) OnFlush(reason buffer.FlushReason, stats buffer.FlushStats, duration time.Duration, err error) {
 	ctx := context.Background()
 	attrs := metric.WithAttributes(
 		attribute.String("reason", string(reason)),

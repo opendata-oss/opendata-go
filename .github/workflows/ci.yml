@@ -16,7 +16,7 @@ jobs:
           - name: Root Module
             module: .
             go_version_file: go.mod
-            targets: ./ingest ./objstore ./test/compat-producer
+            targets: ./buffer ./objstore ./test/compat-producer
           - name: Exporter Module
             module: exporter/opendataexporter
             go_version_file: exporter/opendataexporter/go.mod
@@ -41,7 +41,7 @@ jobs:
           - name: Root Module
             module: .
             go_version_file: go.mod
-            targets: ./ingest ./objstore ./test/compat-producer
+            targets: ./buffer ./objstore ./test/compat-producer
           - name: Exporter Module
             module: exporter/opendataexporter
             go_version_file: exporter/opendataexporter/go.mod

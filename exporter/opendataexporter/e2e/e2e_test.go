@@ -23,8 +23,8 @@ import (
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/opendata-oss/opendata-go/buffer"
 	opendataexporter "github.com/opendata-oss/opendata-go/exporter/opendataexporter"
-	"github.com/opendata-oss/opendata-go/ingest"
 	"github.com/opendata-oss/opendata-go/objstore"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -281,7 +281,7 @@ func verifyExportedMetrics(t *testing.T, client *s3.Client, bucket, manifestPath
 
 	manifestResult := waitForObject(t, ctx, store, manifestPath)
 
-	entries, err := ingest.DecodeManifestEntries(manifestResult.Data)
+	entries, err := buffer.DecodeManifestEntries(manifestResult.Data)
 	if err != nil {
 		t.Fatalf("decode manifest: %v", err)
 	}
@@ -301,7 +301,7 @@ func verifyExportedMetrics(t *testing.T, client *s3.Client, bucket, manifestPath
 	}
 
 	batchResult := waitForObject(t, ctx, store, entries[0].Location)
-	payloads, err := ingest.DecodeBatch(batchResult.Data)
+	payloads, err := buffer.DecodeBatch(batchResult.Data)
 	if err != nil {
 		t.Fatalf("decode batch: %v", err)
 	}

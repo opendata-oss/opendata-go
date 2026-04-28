@@ -1,5 +1,5 @@
-// Package ingest provides Go bindings for the opendata stateless ingest component.
-package ingest
+// Package buffer provides Go bindings for the opendata stateless buffer component.
+package buffer
 
 import (
 	"encoding/binary"

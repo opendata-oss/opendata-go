@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/opendata-oss/opendata-go/ingest"
+	"github.com/opendata-oss/opendata-go/buffer"
 	"github.com/opendata-oss/opendata-go/objstore"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -53,7 +53,7 @@ func TestOpenDataExporterConsumeMetricsRoundTrip(t *testing.T) {
 		t.Fatalf("Get manifest returned error: %v", err)
 	}
 
-	entries, err := ingest.DecodeManifestEntries(manifestResult.Data)
+	entries, err := buffer.DecodeManifestEntries(manifestResult.Data)
 	if err != nil {
 		t.Fatalf("DecodeManifestEntries returned error: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestOpenDataExporterConsumeMetricsRoundTrip(t *testing.T) {
 		t.Fatalf("Get batch returned error: %v", err)
 	}
 
-	payloads, err := ingest.DecodeBatch(batchResult.Data)
+	payloads, err := buffer.DecodeBatch(batchResult.Data)
 	if err != nil {
 		t.Fatalf("DecodeBatch returned error: %v", err)
 	}

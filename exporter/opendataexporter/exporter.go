@@ -10,7 +10,7 @@ import (
 
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/opendata-oss/opendata-go/ingest"
+	"github.com/opendata-oss/opendata-go/buffer"
 	"github.com/opendata-oss/opendata-go/objstore"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
@@ -30,7 +30,7 @@ type openDataExporter struct {
 	telemetry    *exporterTelemetry
 
 	mu       sync.RWMutex
-	ingestor *ingest.Ingestor
+	producer *buffer.Producer
 }
 
 func newOpenDataExporter(cfg *Config) *openDataExporter {
@@ -62,7 +62,7 @@ func (e *openDataExporter) Start(ctx context.Context, _ component.Host) error {
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.ingestor != nil {
+	if e.producer != nil {
 		return nil
 	}
 
@@ -76,15 +76,15 @@ func (e *openDataExporter) Start(ctx context.Context, _ component.Host) error {
 		return err
 	}
 
-	ingestConfig := ingest.DefaultIngestorConfig()
-	ingestConfig.DataPathPrefix = e.config.DataPathPrefix
-	ingestConfig.ManifestPath = e.config.ManifestPath
-	ingestConfig.FlushInterval = e.config.FlushInterval
-	ingestConfig.FlushSizeBytes = e.config.FlushSizeBytes
-	ingestConfig.BatchCompression = compression
-	ingestConfig.Observer = e.telemetry
+	producerConfig := buffer.DefaultProducerConfig()
+	producerConfig.DataPathPrefix = e.config.DataPathPrefix
+	producerConfig.ManifestPath = e.config.ManifestPath
+	producerConfig.FlushInterval = e.config.FlushInterval
+	producerConfig.FlushSizeBytes = e.config.FlushSizeBytes
+	producerConfig.BatchCompression = compression
+	producerConfig.Observer = e.telemetry
 
-	e.ingestor = ingest.NewIngestor(store, ingestConfig)
+	e.producer = buffer.NewProducer(store, producerConfig)
 	e.telemetry.logger.Info(
 		"Starting OpenData exporter",
 		zap.String("bucket", e.config.ObjectStore.Bucket),
@@ -100,14 +100,14 @@ func (e *openDataExporter) Start(ctx context.Context, _ component.Host) error {
 
 func (e *openDataExporter) Shutdown(ctx context.Context) error {
 	e.mu.Lock()
-	ing := e.ingestor
-	e.ingestor = nil
+	p := e.producer
+	e.producer = nil
 	e.mu.Unlock()
 
-	if ing == nil {
+	if p == nil {
 		return nil
 	}
-	return ing.Close(ctx)
+	return p.Close(ctx)
 }
 
 func (e *openDataExporter) Capabilities() consumer.Capabilities {
@@ -129,15 +129,15 @@ func (e *openDataExporter) ConsumeMetrics(ctx context.Context, md pmetric.Metric
 	e.telemetry.recordMarshal(ctx, len(buf), time.Since(marshalStart))
 
 	e.mu.RLock()
-	ing := e.ingestor
+	producer := e.producer
 	e.mu.RUnlock()
-	if ing == nil {
+	if producer == nil {
 		e.telemetry.recordFailure(ctx, "start", errExporterNotStarted)
 		return errExporterNotStarted
 	}
 
 	enqueueStart := time.Now()
-	handle, err := ing.Ingest([][]byte{buf}, e.metadata)
+	handle, err := producer.Append([][]byte{buf}, e.metadata)
 	e.telemetry.recordEnqueueWait(ctx, time.Since(enqueueStart))
 	if err != nil {
 		e.telemetry.recordFailure(ctx, "enqueue", err)
@@ -172,12 +172,12 @@ func newObjectStore(ctx context.Context, cfg ObjectStoreConfig) (objstore.Object
 	return objstore.NewS3(client, cfg.Bucket), nil
 }
 
-func compressionTypeFromString(value string) (ingest.CompressionType, error) {
+func compressionTypeFromString(value string) (buffer.CompressionType, error) {
 	switch strings.ToLower(value) {
 	case compressionNone:
-		return ingest.CompressionNone, nil
+		return buffer.CompressionNone, nil
 	case compressionZstd:
-		return ingest.CompressionZstd, nil
+		return buffer.CompressionZstd, nil
 	default:
 		return 0, fmt.Errorf("unsupported compression %q", value)
 	}

@@ -9,7 +9,7 @@ Go bindings for the [OpenData](https://github.com/opendata-oss/opendata) project
 
 | Package | Description |
 |---------|-------------|
-| [`ingest`](ingest/) | Stateless ingestion library |
+| [`buffer`](buffer/) | Stateless buffering library |
 | [`objstore`](objstore/) | Object storage abstraction with S3 and in-memory implementations. |
 
 ## Releases
