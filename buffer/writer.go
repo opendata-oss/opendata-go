@@ -128,12 +128,12 @@ func (b *batchAccumulator) stats() FlushStats {
 	}
 }
 
-// Buffer accepts opaque byte entries, batches them, and flushes to object
+// Writer accepts opaque byte entries, batches them, and flushes to object
 // storage on size or time thresholds.
-type Buffer struct {
+type Writer struct {
 	producer *queueProducer
 	store    objstore.ObjectStore
-	config   BufferConfig
+	config   WriterConfig
 
 	appendCh  chan *appendMessage
 	flushCh   chan *flushMessage
@@ -141,10 +141,10 @@ type Buffer struct {
 	closeOnce sync.Once
 }
 
-// NewBuffer creates a new Buffer backed by the given ObjectStore.
-func NewBuffer(store objstore.ObjectStore, config BufferConfig) *Buffer {
+// NewWriter creates a new Writer backed by the given ObjectStore.
+func NewWriter(store objstore.ObjectStore, config WriterConfig) *Writer {
 	producer := newQueueProducer(store, config.ManifestPath)
-	b := &Buffer{
+	w := &Writer{
 		producer: producer,
 		store:    store,
 		config:   config,
@@ -152,12 +152,12 @@ func NewBuffer(store objstore.ObjectStore, config BufferConfig) *Buffer {
 		flushCh:  make(chan *flushMessage),
 		done:     make(chan struct{}),
 	}
-	go b.run()
-	return b
+	go w.run()
+	return w
 }
 
-func (b *Buffer) run() {
-	defer close(b.done)
+func (w *Writer) run() {
+	defer close(w.done)
 
 	batch := &batchAccumulator{}
 
@@ -167,7 +167,7 @@ func (b *Buffer) run() {
 			timer.Stop()
 		}
 		if batch.started {
-			remaining := time.Until(batch.startedAt.Add(b.config.FlushInterval))
+			remaining := time.Until(batch.startedAt.Add(w.config.FlushInterval))
 			if remaining <= 0 {
 				remaining = 0
 			}
@@ -186,30 +186,30 @@ func (b *Buffer) run() {
 		}
 
 		select {
-		case msg, ok := <-b.appendCh:
+		case msg, ok := <-w.appendCh:
 			if !ok {
 				// Channel closed — flush remaining and exit.
-				_ = b.writeBatch(batch, FlushReasonShutdown)
+				_ = w.writeBatch(batch, FlushReasonShutdown)
 				return
 			}
 			batch.add(msg)
-			if batch.sizeBytes >= b.config.FlushSizeBytes {
-				_ = b.writeBatch(batch, FlushReasonSize)
+			if batch.sizeBytes >= w.config.FlushSizeBytes {
+				_ = w.writeBatch(batch, FlushReasonSize)
 			}
-		case fm := <-b.flushCh:
+		case fm := <-w.flushCh:
 			// Drain any pending append messages before flushing.
-			b.drainAppendCh(batch)
-			fm.result <- b.writeBatch(batch, FlushReasonManual)
+			w.drainAppendCh(batch)
+			fm.result <- w.writeBatch(batch, FlushReasonManual)
 		case <-timerCh:
-			_ = b.writeBatch(batch, FlushReasonTime)
+			_ = w.writeBatch(batch, FlushReasonTime)
 		}
 	}
 }
 
-func (b *Buffer) drainAppendCh(batch *batchAccumulator) {
+func (w *Writer) drainAppendCh(batch *batchAccumulator) {
 	for {
 		select {
-		case msg, ok := <-b.appendCh:
+		case msg, ok := <-w.appendCh:
 			if !ok {
 				return
 			}
@@ -220,7 +220,7 @@ func (b *Buffer) drainAppendCh(batch *batchAccumulator) {
 	}
 }
 
-func (b *Buffer) writeBatch(batch *batchAccumulator, reason FlushReason) error {
+func (w *Writer) writeBatch(batch *batchAccumulator, reason FlushReason) error {
 	if batch.isEmpty() {
 		return nil
 	}
@@ -228,41 +228,41 @@ func (b *Buffer) writeBatch(batch *batchAccumulator, reason FlushReason) error {
 	stats := batch.stats()
 	start := time.Now()
 	entries, metadata, watchers := batch.reset()
-	err := b.writeAndEnqueue(entries, metadata)
-	if b.config.Observer != nil {
-		b.config.Observer.OnFlush(reason, stats, time.Since(start), err)
+	err := w.writeAndEnqueue(entries, metadata)
+	if w.config.Observer != nil {
+		w.config.Observer.OnFlush(reason, stats, time.Since(start), err)
 	}
-	for _, w := range watchers {
-		w.resolve(err)
+	for _, dw := range watchers {
+		dw.resolve(err)
 	}
 	return err
 }
 
-func (b *Buffer) writeAndEnqueue(entries [][]byte, metadata []QueueMetadata) error {
-	payload, err := EncodeBatch(entries, b.config.BatchCompression)
+func (w *Writer) writeAndEnqueue(entries [][]byte, metadata []QueueMetadata) error {
+	payload, err := EncodeBatch(entries, w.config.BatchCompression)
 	if err != nil {
 		return err
 	}
 
 	id := ulid.Make()
-	path := fmt.Sprintf("%s/%s.batch", b.config.DataPathPrefix, id.String())
+	path := fmt.Sprintf("%s/%s.batch", w.config.DataPathPrefix, id.String())
 
 	ctx := context.Background()
 	putStart := time.Now()
-	if err := b.store.Put(ctx, path, payload); err != nil {
-		if b.config.Observer != nil {
-			b.config.Observer.OnStorePut(len(payload), time.Since(putStart), err)
+	if err := w.store.Put(ctx, path, payload); err != nil {
+		if w.config.Observer != nil {
+			w.config.Observer.OnStorePut(len(payload), time.Since(putStart), err)
 		}
 		return storageErr(err.Error())
 	}
-	if b.config.Observer != nil {
-		b.config.Observer.OnStorePut(len(payload), time.Since(putStart), nil)
+	if w.config.Observer != nil {
+		w.config.Observer.OnStorePut(len(payload), time.Since(putStart), nil)
 	}
 
 	manifestStart := time.Now()
-	conflicts, err := b.producer.enqueue(ctx, path, metadata)
-	if b.config.Observer != nil {
-		b.config.Observer.OnManifestEnqueue(len(metadata), time.Since(manifestStart), conflicts, err)
+	conflicts, err := w.producer.enqueue(ctx, path, metadata)
+	if w.config.Observer != nil {
+		w.config.Observer.OnManifestEnqueue(len(metadata), time.Since(manifestStart), conflicts, err)
 	}
 	return err
 }
@@ -270,7 +270,7 @@ func (b *Buffer) writeAndEnqueue(entries [][]byte, metadata []QueueMetadata) err
 // Append submits entries and associated metadata for buffering.
 // It returns a WriteHandle whose Watcher can be used to await durability.
 // Applies backpressure when the internal buffer is full.
-func (b *Buffer) Append(entries [][]byte, metadata []byte) (*WriteHandle, error) {
+func (w *Writer) Append(entries [][]byte, metadata []byte) (*WriteHandle, error) {
 	if len(entries) == 0 {
 		return nil, invalidInputErr("entries must not be empty")
 	}
@@ -287,22 +287,22 @@ func (b *Buffer) Append(entries [][]byte, metadata []byte) (*WriteHandle, error)
 	}
 
 	select {
-	case b.appendCh <- msg:
-		if b.config.Observer != nil {
-			b.config.Observer.OnAccepted()
+	case w.appendCh <- msg:
+		if w.config.Observer != nil {
+			w.config.Observer.OnAccepted()
 		}
 		return &WriteHandle{Watcher: watcher}, nil
-	case <-b.done:
+	case <-w.done:
 		return nil, ErrShutdown
 	}
 }
 
 // Flush forces a flush of the current batch, blocking until it is durably written.
-func (b *Buffer) Flush(ctx context.Context) error {
+func (w *Writer) Flush(ctx context.Context) error {
 	fm := &flushMessage{result: make(chan error, 1)}
 	select {
-	case b.flushCh <- fm:
-	case <-b.done:
+	case w.flushCh <- fm:
+	case <-w.done:
 		return ErrShutdown
 	case <-ctx.Done():
 		return ctx.Err()
@@ -316,17 +316,17 @@ func (b *Buffer) Flush(ctx context.Context) error {
 }
 
 // ConflictRate returns the percentage of manifest writes that encountered a conflict.
-func (b *Buffer) ConflictRate() float64 {
-	return b.producer.conflictRate()
+func (w *Writer) ConflictRate() float64 {
+	return w.producer.conflictRate()
 }
 
-// Close flushes any remaining buffered entries and shuts down the buffer.
-func (b *Buffer) Close(ctx context.Context) error {
+// Close flushes any remaining buffered entries and shuts down the writer.
+func (w *Writer) Close(ctx context.Context) error {
 	var err error
-	b.closeOnce.Do(func() {
-		err = b.Flush(ctx)
-		close(b.appendCh)
-		<-b.done
+	w.closeOnce.Do(func() {
+		err = w.Flush(ctx)
+		close(w.appendCh)
+		<-w.done
 	})
 	return err
 }

@@ -2,7 +2,7 @@ package buffer
 
 import "time"
 
-// Default configuration values for BufferConfig.
+// Default configuration values for WriterConfig.
 const (
 	DefaultDataPathPrefix    = "ingest"
 	DefaultManifestPath      = "ingest/manifest"
@@ -11,9 +11,9 @@ const (
 	DefaultMaxBufferedInputs = 1000
 )
 
-// BufferConfig controls where data batches and the queue manifest are stored,
+// WriterConfig controls where data batches and the queue manifest are stored,
 // how often batches are flushed, and when backpressure is applied.
-type BufferConfig struct {
+type WriterConfig struct {
 	// DataPathPrefix is the path prefix for data batch objects in object storage.
 	DataPathPrefix string
 
@@ -37,9 +37,9 @@ type BufferConfig struct {
 	Observer Observer
 }
 
-// DefaultBufferConfig returns a BufferConfig with sensible defaults.
-func DefaultBufferConfig() BufferConfig {
-	return BufferConfig{
+// DefaultWriterConfig returns a WriterConfig with sensible defaults.
+func DefaultWriterConfig() WriterConfig {
+	return WriterConfig{
 		DataPathPrefix:    DefaultDataPathPrefix,
 		ManifestPath:      DefaultManifestPath,
 		FlushInterval:     DefaultFlushInterval,

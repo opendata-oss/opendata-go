@@ -30,7 +30,7 @@ type openDataExporter struct {
 	telemetry    *exporterTelemetry
 
 	mu     sync.RWMutex
-	buffer *buffer.Buffer
+	writer *buffer.Writer
 }
 
 func newOpenDataExporter(cfg *Config) *openDataExporter {
@@ -62,7 +62,7 @@ func (e *openDataExporter) Start(ctx context.Context, _ component.Host) error {
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.buffer != nil {
+	if e.writer != nil {
 		return nil
 	}
 
@@ -76,15 +76,15 @@ func (e *openDataExporter) Start(ctx context.Context, _ component.Host) error {
 		return err
 	}
 
-	bufferConfig := buffer.DefaultBufferConfig()
-	bufferConfig.DataPathPrefix = e.config.DataPathPrefix
-	bufferConfig.ManifestPath = e.config.ManifestPath
-	bufferConfig.FlushInterval = e.config.FlushInterval
-	bufferConfig.FlushSizeBytes = e.config.FlushSizeBytes
-	bufferConfig.BatchCompression = compression
-	bufferConfig.Observer = e.telemetry
+	writerConfig := buffer.DefaultWriterConfig()
+	writerConfig.DataPathPrefix = e.config.DataPathPrefix
+	writerConfig.ManifestPath = e.config.ManifestPath
+	writerConfig.FlushInterval = e.config.FlushInterval
+	writerConfig.FlushSizeBytes = e.config.FlushSizeBytes
+	writerConfig.BatchCompression = compression
+	writerConfig.Observer = e.telemetry
 
-	e.buffer = buffer.NewBuffer(store, bufferConfig)
+	e.writer = buffer.NewWriter(store, writerConfig)
 	e.telemetry.logger.Info(
 		"Starting OpenData exporter",
 		zap.String("bucket", e.config.ObjectStore.Bucket),
@@ -100,14 +100,14 @@ func (e *openDataExporter) Start(ctx context.Context, _ component.Host) error {
 
 func (e *openDataExporter) Shutdown(ctx context.Context) error {
 	e.mu.Lock()
-	buf := e.buffer
-	e.buffer = nil
+	w := e.writer
+	e.writer = nil
 	e.mu.Unlock()
 
-	if buf == nil {
+	if w == nil {
 		return nil
 	}
-	return buf.Close(ctx)
+	return w.Close(ctx)
 }
 
 func (e *openDataExporter) Capabilities() consumer.Capabilities {
@@ -129,15 +129,15 @@ func (e *openDataExporter) ConsumeMetrics(ctx context.Context, md pmetric.Metric
 	e.telemetry.recordMarshal(ctx, len(buf), time.Since(marshalStart))
 
 	e.mu.RLock()
-	bufferInst := e.buffer
+	writer := e.writer
 	e.mu.RUnlock()
-	if bufferInst == nil {
+	if writer == nil {
 		e.telemetry.recordFailure(ctx, "start", errExporterNotStarted)
 		return errExporterNotStarted
 	}
 
 	enqueueStart := time.Now()
-	handle, err := bufferInst.Append([][]byte{buf}, e.metadata)
+	handle, err := writer.Append([][]byte{buf}, e.metadata)
 	e.telemetry.recordEnqueueWait(ctx, time.Since(enqueueStart))
 	if err != nil {
 		e.telemetry.recordFailure(ctx, "enqueue", err)
