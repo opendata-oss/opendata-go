@@ -2,7 +2,7 @@
 
 EXPORTER_MODULE := exporter/opendataexporter
 ROOT_GO_FILES := $(shell find . -name '*.go' -not -path './$(EXPORTER_MODULE)/*' -not -path './.git/*')
-ROOT_GO_PACKAGES := ./ingest ./objstore ./test/compat-producer
+ROOT_GO_PACKAGES := ./buffer ./objstore ./test/compat-producer
 
 # Format all Go files (equivalent to cargo fmt)
 fmt:

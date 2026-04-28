@@ -1,5 +1,5 @@
 // Package objstore defines an object storage interface compatible with the
-// opendata ingest manifest's optimistic-concurrency protocol.
+// opendata buffer manifest's optimistic-concurrency protocol.
 package objstore
 
 import (

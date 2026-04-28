@@ -5,7 +5,7 @@
 This repository contains a root Go module plus a nested exporter module at `exporter/opendataexporter`.
 
 Key areas:
-- `ingest`: batching, durability, manifest enqueueing
+- `buffer`: batching, durability, manifest enqueueing
 - `objstore`: object storage abstractions and implementations
 - `exporter/opendataexporter`: OpenTelemetry Collector exporter module
 - `test/compat-producer`: compatibility test helper
@@ -13,7 +13,7 @@ Key areas:
 ## Working Style
 
 - Keep changes minimal and local to the affected package.
-- Preserve existing package boundaries. `ingest` should stay reusable and should not take direct Collector dependencies.
+- Preserve existing package boundaries. `buffer` should stay reusable and should not take direct Collector dependencies.
 - Prefer adding observability through small interfaces/hooks when instrumentation crosses package boundaries.
 - Use ASCII unless the file already requires otherwise.
 
@@ -64,7 +64,7 @@ Working lint commands:
 ```sh
 GOCACHE=/tmp/opendata-go-lint/root-go-build \
 GOLANGCI_LINT_CACHE=/tmp/opendata-go-lint/root-golangci-lint \
-golangci-lint run ./ingest ./objstore ./test/compat-producer
+golangci-lint run ./buffer ./objstore ./test/compat-producer
 ```
 
 ```sh

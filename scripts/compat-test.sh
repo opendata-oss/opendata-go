@@ -2,7 +2,7 @@
 #
 # Cross-language compatibility test: Go producer → Rust consumer
 #
-# Spins up a MinIO container, runs the Go ingestor to write batches,
+# Spins up a MinIO container, runs the Go buffer to write batches,
 # then runs the Rust collector to read and verify them.
 #
 # Prerequisites:

@@ -1,5 +1,5 @@
 // compat-producer writes test batches to an S3-compatible store using the Go
-// ingestor, then exits. The Rust compat-consumer reads and verifies them.
+// buffer, then exits. The Rust compat-consumer reads and verifies them.
 package main
 
 import (
@@ -14,7 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
-	"github.com/opendata-oss/opendata-go/ingest"
+	"github.com/opendata-oss/opendata-go/buffer"
 	"github.com/opendata-oss/opendata-go/objstore"
 )
 
@@ -46,7 +46,7 @@ func main() {
 
 	store := objstore.NewS3(client, bucket)
 
-	config := ingest.IngestorConfig{
+	config := buffer.BufferConfig{
 		DataPathPrefix:    "ingest",
 		ManifestPath:      "ingest/manifest",
 		FlushInterval:     24 * time.Hour,
@@ -55,7 +55,7 @@ func main() {
 		BatchCompression:  compressionFromEnv(),
 	}
 
-	ing := ingest.NewIngestor(store, config)
+	buf := buffer.NewBuffer(store, config)
 
 	// Write 3 separate batches with known data.
 	batches := []struct {
@@ -77,16 +77,16 @@ func main() {
 	}
 
 	for i, b := range batches {
-		if _, err := ing.Ingest(b.entries, b.metadata); err != nil {
-			log.Fatalf("ingest batch %d failed: %v", i+1, err)
+		if _, err := buf.Append(b.entries, b.metadata); err != nil {
+			log.Fatalf("append batch %d failed: %v", i+1, err)
 		}
-		if err := ing.Flush(ctx); err != nil {
+		if err := buf.Flush(ctx); err != nil {
 			log.Fatalf("flush batch %d failed: %v", i+1, err)
 		}
 		fmt.Printf("produced batch %d (%d entries)\n", i+1, len(b.entries))
 	}
 
-	if err := ing.Close(ctx); err != nil {
+	if err := buf.Close(ctx); err != nil {
 		log.Fatalf("close failed: %v", err)
 	}
 
@@ -100,12 +100,12 @@ func envOrDefault(key, fallback string) string {
 	return fallback
 }
 
-func compressionFromEnv() ingest.CompressionType {
+func compressionFromEnv() buffer.CompressionType {
 	switch os.Getenv("BATCH_COMPRESSION") {
 	case "zstd":
-		return ingest.CompressionZstd
+		return buffer.CompressionZstd
 	default:
-		return ingest.CompressionNone
+		return buffer.CompressionNone
 	}
 }
 

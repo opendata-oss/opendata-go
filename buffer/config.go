@@ -1,8 +1,8 @@
-package ingest
+package buffer
 
 import "time"
 
-// Default configuration values for IngestorConfig.
+// Default configuration values for BufferConfig.
 const (
 	DefaultDataPathPrefix    = "ingest"
 	DefaultManifestPath      = "ingest/manifest"
@@ -11,9 +11,9 @@ const (
 	DefaultMaxBufferedInputs = 1000
 )
 
-// IngestorConfig controls where data batches and the queue manifest are stored,
+// BufferConfig controls where data batches and the queue manifest are stored,
 // how often batches are flushed, and when backpressure is applied.
-type IngestorConfig struct {
+type BufferConfig struct {
 	// DataPathPrefix is the path prefix for data batch objects in object storage.
 	DataPathPrefix string
 
@@ -33,13 +33,13 @@ type IngestorConfig struct {
 	// BatchCompression is the compression algorithm for data batches.
 	BatchCompression CompressionType
 
-	// Observer receives lifecycle events from the ingestor.
+	// Observer receives lifecycle events from the buffer.
 	Observer Observer
 }
 
-// DefaultIngestorConfig returns an IngestorConfig with sensible defaults.
-func DefaultIngestorConfig() IngestorConfig {
-	return IngestorConfig{
+// DefaultBufferConfig returns a BufferConfig with sensible defaults.
+func DefaultBufferConfig() BufferConfig {
+	return BufferConfig{
 		DataPathPrefix:    DefaultDataPathPrefix,
 		ManifestPath:      DefaultManifestPath,
 		FlushInterval:     DefaultFlushInterval,

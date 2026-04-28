@@ -1,4 +1,4 @@
-package ingest
+package buffer
 
 import (
 	"bytes"
@@ -9,8 +9,8 @@ import (
 	"github.com/opendata-oss/opendata-go/objstore"
 )
 
-func testConfig() IngestorConfig {
-	return IngestorConfig{
+func testConfig() BufferConfig {
+	return BufferConfig{
 		DataPathPrefix:    "test-ingest",
 		ManifestPath:      "test/manifest",
 		FlushInterval:     24 * time.Hour,
@@ -33,18 +33,18 @@ func readManifestEntries(t *testing.T, store objstore.ObjectStore) []QueueEntry 
 	return entries
 }
 
-func TestIngestor_should_ingest_entries_and_enqueue_location(t *testing.T) {
+func TestBuffer_should_append_entries_and_enqueue_location(t *testing.T) {
 	store := objstore.NewInMemory()
-	ing := NewIngestor(store, testConfig())
+	buf := NewBuffer(store, testConfig())
 
 	ctx := context.Background()
-	if _, err := ing.Ingest([][]byte{[]byte("data1")}, nil); err != nil {
+	if _, err := buf.Append([][]byte{[]byte("data1")}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ing.Ingest([][]byte{[]byte("data2")}, nil); err != nil {
+	if _, err := buf.Append([][]byte{[]byte("data2")}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := ing.Flush(ctx); err != nil {
+	if err := buf.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -57,15 +57,15 @@ func TestIngestor_should_ingest_entries_and_enqueue_location(t *testing.T) {
 	}
 }
 
-func TestIngestor_should_write_valid_batch_to_object_store(t *testing.T) {
+func TestBuffer_should_write_valid_batch_to_object_store(t *testing.T) {
 	store := objstore.NewInMemory()
-	ing := NewIngestor(store, testConfig())
+	buf := NewBuffer(store, testConfig())
 
 	ctx := context.Background()
-	if _, err := ing.Ingest([][]byte{[]byte("mydata")}, nil); err != nil {
+	if _, err := buf.Append([][]byte{[]byte("mydata")}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := ing.Flush(ctx); err != nil {
+	if err := buf.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -83,14 +83,14 @@ func TestIngestor_should_write_valid_batch_to_object_store(t *testing.T) {
 	}
 }
 
-func TestIngestor_should_flush_when_batch_size_exceeded(t *testing.T) {
+func TestBuffer_should_flush_when_batch_size_exceeded(t *testing.T) {
 	store := objstore.NewInMemory()
 	config := testConfig()
 	config.FlushSizeBytes = 10
-	ing := NewIngestor(store, config)
+	buf := NewBuffer(store, config)
 
 	ctx := context.Background()
-	wh, err := ing.Ingest([][]byte{[]byte("some-long-data")}, nil)
+	wh, err := buf.Append([][]byte{[]byte("some-long-data")}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,15 +104,15 @@ func TestIngestor_should_flush_when_batch_size_exceeded(t *testing.T) {
 	}
 }
 
-func TestIngestor_should_flush_when_interval_elapsed(t *testing.T) {
+func TestBuffer_should_flush_when_interval_elapsed(t *testing.T) {
 	store := objstore.NewInMemory()
 	config := testConfig()
 	config.FlushInterval = 50 * time.Millisecond
 	config.FlushSizeBytes = 64 * 1024 * 1024
-	ing := NewIngestor(store, config)
+	buf := NewBuffer(store, config)
 
 	ctx := context.Background()
-	wh, err := ing.Ingest([][]byte{[]byte("v1")}, nil)
+	wh, err := buf.Append([][]byte{[]byte("v1")}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,20 +132,20 @@ func TestIngestor_should_flush_when_interval_elapsed(t *testing.T) {
 	}
 }
 
-func TestIngestor_should_batch_multiple_ingests_into_single_file(t *testing.T) {
+func TestBuffer_should_batch_multiple_appends_into_single_file(t *testing.T) {
 	store := objstore.NewInMemory()
-	ing := NewIngestor(store, testConfig())
+	buf := NewBuffer(store, testConfig())
 
 	ctx := context.Background()
-	wh1, err := ing.Ingest([][]byte{[]byte("data1")}, nil)
+	wh1, err := buf.Append([][]byte{[]byte("data1")}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wh2, err := ing.Ingest([][]byte{[]byte("data2")}, nil)
+	wh2, err := buf.Append([][]byte{[]byte("data2")}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ing.Flush(ctx); err != nil {
+	if err := buf.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -179,11 +179,11 @@ func TestIngestor_should_batch_multiple_ingests_into_single_file(t *testing.T) {
 	}
 }
 
-func TestIngestor_should_not_flush_empty_batch(t *testing.T) {
+func TestBuffer_should_not_flush_empty_batch(t *testing.T) {
 	store := objstore.NewInMemory()
-	ing := NewIngestor(store, testConfig())
+	buf := NewBuffer(store, testConfig())
 
-	if err := ing.Flush(context.Background()); err != nil {
+	if err := buf.Flush(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -193,30 +193,30 @@ func TestIngestor_should_not_flush_empty_batch(t *testing.T) {
 	}
 }
 
-func TestIngestor_should_reject_empty_entries(t *testing.T) {
+func TestBuffer_should_reject_empty_entries(t *testing.T) {
 	store := objstore.NewInMemory()
-	ing := NewIngestor(store, testConfig())
+	buf := NewBuffer(store, testConfig())
 
-	_, err := ing.Ingest(nil, nil)
+	_, err := buf.Append(nil, nil)
 	if err == nil {
 		t.Fatal("expected error for nil entries")
 	}
-	_, err = ing.Ingest([][]byte{}, []byte("meta"))
+	_, err = buf.Append([][]byte{}, []byte("meta"))
 	if err == nil {
 		t.Fatal("expected error for empty entries")
 	}
 }
 
-func TestIngestor_should_flush_remaining_entries_on_close(t *testing.T) {
+func TestBuffer_should_flush_remaining_entries_on_close(t *testing.T) {
 	store := objstore.NewInMemory()
-	ing := NewIngestor(store, testConfig())
+	buf := NewBuffer(store, testConfig())
 
-	if _, err := ing.Ingest([][]byte{[]byte("unflushed")}, nil); err != nil {
+	if _, err := buf.Append([][]byte{[]byte("unflushed")}, nil); err != nil {
 		t.Fatal(err)
 	}
 
 	ctx := context.Background()
-	if err := ing.Close(ctx); err != nil {
+	if err := buf.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -238,22 +238,22 @@ func TestIngestor_should_flush_remaining_entries_on_close(t *testing.T) {
 	}
 }
 
-func TestIngestor_should_produce_separate_batches_per_flush(t *testing.T) {
+func TestBuffer_should_produce_separate_batches_per_flush(t *testing.T) {
 	store := objstore.NewInMemory()
-	ing := NewIngestor(store, testConfig())
+	buf := NewBuffer(store, testConfig())
 
 	ctx := context.Background()
-	if _, err := ing.Ingest([][]byte{[]byte("batch1")}, nil); err != nil {
+	if _, err := buf.Append([][]byte{[]byte("batch1")}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := ing.Flush(ctx); err != nil {
+	if err := buf.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := ing.Ingest([][]byte{[]byte("batch2")}, nil); err != nil {
+	if _, err := buf.Append([][]byte{[]byte("batch2")}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := ing.Flush(ctx); err != nil {
+	if err := buf.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -266,16 +266,16 @@ func TestIngestor_should_produce_separate_batches_per_flush(t *testing.T) {
 	}
 }
 
-func TestIngestor_should_record_metadata_in_queue_entry(t *testing.T) {
+func TestBuffer_should_record_metadata_in_queue_entry(t *testing.T) {
 	store := objstore.NewInMemory()
-	ing := NewIngestor(store, testConfig())
+	buf := NewBuffer(store, testConfig())
 
 	ctx := context.Background()
 	meta := []byte(`{"topic":"events"}`)
-	if _, err := ing.Ingest([][]byte{[]byte("payload")}, meta); err != nil {
+	if _, err := buf.Append([][]byte{[]byte("payload")}, meta); err != nil {
 		t.Fatal(err)
 	}
-	if err := ing.Flush(ctx); err != nil {
+	if err := buf.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
 

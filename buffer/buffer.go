@@ -1,4 +1,4 @@
-package ingest
+package buffer
 
 import (
 	"context"
@@ -56,12 +56,12 @@ func (w *DurabilityWatcher) resolve(err error) {
 	close(w.ch)
 }
 
-// WriteHandle is returned by Ingest and provides access to a DurabilityWatcher.
+// WriteHandle is returned by Append and provides access to a DurabilityWatcher.
 type WriteHandle struct {
 	Watcher *DurabilityWatcher
 }
 
-type ingestMessage struct {
+type appendMessage struct {
 	entries         [][]byte
 	metadata        []byte
 	ingestionTimeMs int64
@@ -81,7 +81,7 @@ type batchAccumulator struct {
 	started   bool
 }
 
-func (b *batchAccumulator) add(msg *ingestMessage) {
+func (b *batchAccumulator) add(msg *appendMessage) {
 	startIndex := uint32(len(b.entries))
 	b.entries = append(b.entries, msg.entries...)
 	b.metadata = append(b.metadata, QueueMetadata{
@@ -128,36 +128,36 @@ func (b *batchAccumulator) stats() FlushStats {
 	}
 }
 
-// Ingestor accepts opaque byte entries, batches them, and flushes to object
+// Buffer accepts opaque byte entries, batches them, and flushes to object
 // storage on size or time thresholds.
-type Ingestor struct {
+type Buffer struct {
 	producer *queueProducer
 	store    objstore.ObjectStore
-	config   IngestorConfig
+	config   BufferConfig
 
-	ingestCh  chan *ingestMessage
+	appendCh  chan *appendMessage
 	flushCh   chan *flushMessage
 	done      chan struct{}
 	closeOnce sync.Once
 }
 
-// NewIngestor creates a new Ingestor backed by the given ObjectStore.
-func NewIngestor(store objstore.ObjectStore, config IngestorConfig) *Ingestor {
+// NewBuffer creates a new Buffer backed by the given ObjectStore.
+func NewBuffer(store objstore.ObjectStore, config BufferConfig) *Buffer {
 	producer := newQueueProducer(store, config.ManifestPath)
-	ing := &Ingestor{
+	b := &Buffer{
 		producer: producer,
 		store:    store,
 		config:   config,
-		ingestCh: make(chan *ingestMessage, config.MaxBufferedInputs),
+		appendCh: make(chan *appendMessage, config.MaxBufferedInputs),
 		flushCh:  make(chan *flushMessage),
 		done:     make(chan struct{}),
 	}
-	go ing.run()
-	return ing
+	go b.run()
+	return b
 }
 
-func (ing *Ingestor) run() {
-	defer close(ing.done)
+func (b *Buffer) run() {
+	defer close(b.done)
 
 	batch := &batchAccumulator{}
 
@@ -167,7 +167,7 @@ func (ing *Ingestor) run() {
 			timer.Stop()
 		}
 		if batch.started {
-			remaining := time.Until(batch.startedAt.Add(ing.config.FlushInterval))
+			remaining := time.Until(batch.startedAt.Add(b.config.FlushInterval))
 			if remaining <= 0 {
 				remaining = 0
 			}
@@ -186,30 +186,30 @@ func (ing *Ingestor) run() {
 		}
 
 		select {
-		case msg, ok := <-ing.ingestCh:
+		case msg, ok := <-b.appendCh:
 			if !ok {
 				// Channel closed — flush remaining and exit.
-				_ = ing.writeBatch(batch, FlushReasonShutdown)
+				_ = b.writeBatch(batch, FlushReasonShutdown)
 				return
 			}
 			batch.add(msg)
-			if batch.sizeBytes >= ing.config.FlushSizeBytes {
-				_ = ing.writeBatch(batch, FlushReasonSize)
+			if batch.sizeBytes >= b.config.FlushSizeBytes {
+				_ = b.writeBatch(batch, FlushReasonSize)
 			}
-		case fm := <-ing.flushCh:
-			// Drain any pending ingest messages before flushing.
-			ing.drainIngestCh(batch)
-			fm.result <- ing.writeBatch(batch, FlushReasonManual)
+		case fm := <-b.flushCh:
+			// Drain any pending append messages before flushing.
+			b.drainAppendCh(batch)
+			fm.result <- b.writeBatch(batch, FlushReasonManual)
 		case <-timerCh:
-			_ = ing.writeBatch(batch, FlushReasonTime)
+			_ = b.writeBatch(batch, FlushReasonTime)
 		}
 	}
 }
 
-func (ing *Ingestor) drainIngestCh(batch *batchAccumulator) {
+func (b *Buffer) drainAppendCh(batch *batchAccumulator) {
 	for {
 		select {
-		case msg, ok := <-ing.ingestCh:
+		case msg, ok := <-b.appendCh:
 			if !ok {
 				return
 			}
@@ -220,7 +220,7 @@ func (ing *Ingestor) drainIngestCh(batch *batchAccumulator) {
 	}
 }
 
-func (ing *Ingestor) writeBatch(batch *batchAccumulator, reason FlushReason) error {
+func (b *Buffer) writeBatch(batch *batchAccumulator, reason FlushReason) error {
 	if batch.isEmpty() {
 		return nil
 	}
@@ -228,9 +228,9 @@ func (ing *Ingestor) writeBatch(batch *batchAccumulator, reason FlushReason) err
 	stats := batch.stats()
 	start := time.Now()
 	entries, metadata, watchers := batch.reset()
-	err := ing.writeAndEnqueue(entries, metadata)
-	if ing.config.Observer != nil {
-		ing.config.Observer.OnFlush(reason, stats, time.Since(start), err)
+	err := b.writeAndEnqueue(entries, metadata)
+	if b.config.Observer != nil {
+		b.config.Observer.OnFlush(reason, stats, time.Since(start), err)
 	}
 	for _, w := range watchers {
 		w.resolve(err)
@@ -238,39 +238,39 @@ func (ing *Ingestor) writeBatch(batch *batchAccumulator, reason FlushReason) err
 	return err
 }
 
-func (ing *Ingestor) writeAndEnqueue(entries [][]byte, metadata []QueueMetadata) error {
-	payload, err := EncodeBatch(entries, ing.config.BatchCompression)
+func (b *Buffer) writeAndEnqueue(entries [][]byte, metadata []QueueMetadata) error {
+	payload, err := EncodeBatch(entries, b.config.BatchCompression)
 	if err != nil {
 		return err
 	}
 
 	id := ulid.Make()
-	path := fmt.Sprintf("%s/%s.batch", ing.config.DataPathPrefix, id.String())
+	path := fmt.Sprintf("%s/%s.batch", b.config.DataPathPrefix, id.String())
 
 	ctx := context.Background()
 	putStart := time.Now()
-	if err := ing.store.Put(ctx, path, payload); err != nil {
-		if ing.config.Observer != nil {
-			ing.config.Observer.OnStorePut(len(payload), time.Since(putStart), err)
+	if err := b.store.Put(ctx, path, payload); err != nil {
+		if b.config.Observer != nil {
+			b.config.Observer.OnStorePut(len(payload), time.Since(putStart), err)
 		}
 		return storageErr(err.Error())
 	}
-	if ing.config.Observer != nil {
-		ing.config.Observer.OnStorePut(len(payload), time.Since(putStart), nil)
+	if b.config.Observer != nil {
+		b.config.Observer.OnStorePut(len(payload), time.Since(putStart), nil)
 	}
 
 	manifestStart := time.Now()
-	conflicts, err := ing.producer.enqueue(ctx, path, metadata)
-	if ing.config.Observer != nil {
-		ing.config.Observer.OnManifestEnqueue(len(metadata), time.Since(manifestStart), conflicts, err)
+	conflicts, err := b.producer.enqueue(ctx, path, metadata)
+	if b.config.Observer != nil {
+		b.config.Observer.OnManifestEnqueue(len(metadata), time.Since(manifestStart), conflicts, err)
 	}
 	return err
 }
 
-// Ingest submits entries and associated metadata for ingestion.
+// Append submits entries and associated metadata for buffering.
 // It returns a WriteHandle whose Watcher can be used to await durability.
 // Applies backpressure when the internal buffer is full.
-func (ing *Ingestor) Ingest(entries [][]byte, metadata []byte) (*WriteHandle, error) {
+func (b *Buffer) Append(entries [][]byte, metadata []byte) (*WriteHandle, error) {
 	if len(entries) == 0 {
 		return nil, invalidInputErr("entries must not be empty")
 	}
@@ -279,7 +279,7 @@ func (ing *Ingestor) Ingest(entries [][]byte, metadata []byte) (*WriteHandle, er
 	}
 
 	watcher := newDurabilityWatcher()
-	msg := &ingestMessage{
+	msg := &appendMessage{
 		entries:         entries,
 		metadata:        metadata,
 		ingestionTimeMs: time.Now().UnixMilli(),
@@ -287,22 +287,22 @@ func (ing *Ingestor) Ingest(entries [][]byte, metadata []byte) (*WriteHandle, er
 	}
 
 	select {
-	case ing.ingestCh <- msg:
-		if ing.config.Observer != nil {
-			ing.config.Observer.OnAccepted()
+	case b.appendCh <- msg:
+		if b.config.Observer != nil {
+			b.config.Observer.OnAccepted()
 		}
 		return &WriteHandle{Watcher: watcher}, nil
-	case <-ing.done:
+	case <-b.done:
 		return nil, ErrShutdown
 	}
 }
 
 // Flush forces a flush of the current batch, blocking until it is durably written.
-func (ing *Ingestor) Flush(ctx context.Context) error {
+func (b *Buffer) Flush(ctx context.Context) error {
 	fm := &flushMessage{result: make(chan error, 1)}
 	select {
-	case ing.flushCh <- fm:
-	case <-ing.done:
+	case b.flushCh <- fm:
+	case <-b.done:
 		return ErrShutdown
 	case <-ctx.Done():
 		return ctx.Err()
@@ -316,17 +316,17 @@ func (ing *Ingestor) Flush(ctx context.Context) error {
 }
 
 // ConflictRate returns the percentage of manifest writes that encountered a conflict.
-func (ing *Ingestor) ConflictRate() float64 {
-	return ing.producer.conflictRate()
+func (b *Buffer) ConflictRate() float64 {
+	return b.producer.conflictRate()
 }
 
-// Close flushes any remaining buffered entries and shuts down the ingestor.
-func (ing *Ingestor) Close(ctx context.Context) error {
+// Close flushes any remaining buffered entries and shuts down the buffer.
+func (b *Buffer) Close(ctx context.Context) error {
 	var err error
-	ing.closeOnce.Do(func() {
-		err = ing.Flush(ctx)
-		close(ing.ingestCh)
-		<-ing.done
+	b.closeOnce.Do(func() {
+		err = b.Flush(ctx)
+		close(b.appendCh)
+		<-b.done
 	})
 	return err
 }

@@ -1,8 +1,8 @@
-package ingest
+package buffer
 
 import "time"
 
-// FlushReason identifies why the ingestor flushed the current batch.
+// FlushReason identifies why the buffer flushed the current batch.
 type FlushReason string
 
 const (
@@ -12,7 +12,7 @@ const (
 	FlushReasonTime FlushReason = "time"
 	// FlushReasonManual indicates that the batch flushed due to an explicit flush request.
 	FlushReasonManual FlushReason = "manual"
-	// FlushReasonShutdown indicates that the batch flushed during ingestor shutdown.
+	// FlushReasonShutdown indicates that the batch flushed during buffer shutdown.
 	FlushReasonShutdown FlushReason = "shutdown"
 )
 
@@ -24,7 +24,7 @@ type FlushStats struct {
 	Age               time.Duration
 }
 
-// Observer receives ingestor lifecycle events for observability.
+// Observer receives buffer lifecycle events for observability.
 type Observer interface {
 	OnAccepted()
 	OnFlush(reason FlushReason, stats FlushStats, duration time.Duration, err error)
