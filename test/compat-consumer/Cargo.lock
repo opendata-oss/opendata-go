@@ -252,8 +252,8 @@ name = "compat-consumer"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "opendata-buffer",
  "opendata-common",
- "opendata-ingest",
  "tokio",
 ]
 
@@ -1406,6 +1406,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "metrics"
+version = "0.24.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7cd3e9eb685089c784f5769b1197d348c7274bc20d4e1349650f63b91b6d0af"
+dependencies = [
+ "portable-atomic",
+ "rapidhash",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1536,31 +1546,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "opendata-common"
-version = "0.1.12"
+name = "opendata-buffer"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26dd205123a1898e66b94c897b7be10632b50f7362205be7e29721ea7769425d"
-dependencies = [
- "async-trait",
- "bytes",
- "foyer",
- "futures",
- "serde",
- "slatedb",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "opendata-ingest"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b07957cca28bd884636efba061c68e40c145b678128411a313c51de34786c14"
+checksum = "c243ee7d1c3112fe0f5f3f2b597259931e370505fbf29147ab4e3c1e8f752bdd"
 dependencies = [
  "bytes",
  "futures",
+ "metrics",
  "opendata-common",
  "serde",
  "serde_with",
@@ -1570,6 +1563,27 @@ dependencies = [
  "tracing",
  "ulid",
  "zstd",
+]
+
+[[package]]
+name = "opendata-common"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e58571de9fa9e1373f8221356d52ed1c7da8ddec4169270e39f2993f59a238b"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "foyer",
+ "futures",
+ "metrics",
+ "mixtrics",
+ "serde",
+ "slatedb",
+ "slatedb-common",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1718,6 +1732,12 @@ name = "pkg-config"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
+
+[[package]]
+name = "portable-atomic"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
 
 [[package]]
 name = "potential_utf"
@@ -1936,6 +1956,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f703f4665700daf5512dcca5f43afa6af89f09db47fb56be587f80636bda2d41"
 dependencies = [
  "rand_core 0.9.5",
+]
+
+[[package]]
+name = "rapidhash"
+version = "4.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5e48930979c155e2f33aa36ab3119b5ee81332beb6482199a8ecd6029b80b59"
+dependencies = [
+ "rustversion",
 ]
 
 [[package]]
@@ -2353,11 +2382,12 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slatedb"
-version = "0.11.2"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d945c6cd6f239873e640c5b7bb204f5638ed5681b02145cdcc2e80b2d3882b8a"
+checksum = "e6519858d579386cb814c761e494bccac59410596db96938627340528d3c6b7b"
 dependencies = [
  "anyhow",
+ "async-channel",
  "async-trait",
  "atomic",
  "backon",
@@ -2400,19 +2430,21 @@ dependencies = [
 
 [[package]]
 name = "slatedb-common"
-version = "0.11.2"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2893ff22bb9a1013af0fb5e85380307ccd9d0a4fa8a111e187a48750e14b9a47"
+checksum = "933cf6a6059814219f35b1b96b84b3481a53ec57d64f2fd7b000effad86cba7f"
 dependencies = [
  "chrono",
+ "log",
+ "serde",
  "tokio",
 ]
 
 [[package]]
 name = "slatedb-txn-obj"
-version = "0.11.2"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c33d5597404e23b9706aa32a1723399f022f0513a289d1059df8810a282dcc4"
+checksum = "f5ab6739c5e58a326fd815e8e5bc72688612bb771d81304b036c42c63bbcfbde"
 dependencies = [
  "async-trait",
  "bytes",

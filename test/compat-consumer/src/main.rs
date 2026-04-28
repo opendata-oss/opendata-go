@@ -2,17 +2,18 @@
 // verifies the data matches expectations.
 //
 // It connects to an S3-compatible store (MinIO in CI), reads all queued batches
-// via the Rust Collector, and asserts that the entries match what the Go
+// via the Rust Consumer, and asserts that the entries match what the Go
 // producer wrote.
 
 use std::env;
 use std::process;
+use std::time::Duration;
 
 use bytes::Bytes;
 
+use buffer::{Consumer, ConsumerConfig};
 use common::ObjectStoreConfig;
 use common::storage::config::AwsObjectStoreConfig;
-use ingest::{Collector, CollectorConfig};
 
 #[tokio::main]
 async fn main() {
@@ -22,16 +23,17 @@ async fn main() {
     // The Rust object_store crate reads AWS_ENDPOINT_URL, AWS_ACCESS_KEY_ID,
     // and AWS_SECRET_ACCESS_KEY from the environment automatically via
     // AmazonS3Builder::from_env().
-    let config = CollectorConfig {
+    let config = ConsumerConfig {
         object_store: ObjectStoreConfig::Aws(AwsObjectStoreConfig { region, bucket }),
         manifest_path: "ingest/manifest".to_string(),
+        data_path_prefix: "ingest".to_string(),
+        gc_interval: Duration::from_secs(300),
+        gc_grace_period: Duration::from_secs(600),
     };
 
-    let collector = Collector::new(config).expect("failed to create collector");
-    collector
-        .initialize(None)
+    let mut consumer = Consumer::new(config, None)
         .await
-        .expect("failed to initialize collector");
+        .expect("failed to create consumer");
 
     // Expected batches from the Go producer.
     let expected: Vec<(Vec<&str>, &str)> = vec![
@@ -42,7 +44,7 @@ async fn main() {
 
     let mut batch_idx = 0;
     loop {
-        match collector.next_batch().await {
+        match consumer.next_batch().await {
             Ok(Some(batch)) => {
                 if batch_idx >= expected.len() {
                     eprintln!("ERROR: received more batches than expected");
@@ -97,7 +99,7 @@ async fn main() {
                     batch.location
                 );
 
-                collector
+                consumer
                     .ack(batch.sequence)
                     .await
                     .expect("failed to ack batch");
@@ -121,7 +123,7 @@ async fn main() {
         process::exit(1);
     }
 
-    collector.close().await.expect("failed to close collector");
+    consumer.close().await.expect("failed to close consumer");
     println!("consumer: done, {} batches verified OK", batch_idx);
 }
 
