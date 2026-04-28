@@ -284,15 +284,15 @@ func (c *conflictCounter) conflictRate() float64 {
 	return rate
 }
 
-// queueProducer appends entries to a shared manifest using optimistic concurrency.
-type queueProducer struct {
+// manifestEnqueuer appends entries to a shared manifest using optimistic concurrency.
+type manifestEnqueuer struct {
 	store        objstore.ObjectStore
 	manifestPath string
 	counter      conflictCounter
 }
 
-func newQueueProducer(store objstore.ObjectStore, manifestPath string) *queueProducer {
-	return &queueProducer{
+func newManifestEnqueuer(store objstore.ObjectStore, manifestPath string) *manifestEnqueuer {
+	return &manifestEnqueuer{
 		store:        store,
 		manifestPath: manifestPath,
 	}
@@ -300,7 +300,7 @@ func newQueueProducer(store objstore.ObjectStore, manifestPath string) *queuePro
 
 // enqueue appends a queue entry to the manifest. Retries automatically on
 // optimistic concurrency conflicts.
-func (p *queueProducer) enqueue(ctx context.Context, location string, metadata []QueueMetadata) (int, error) {
+func (p *manifestEnqueuer) enqueue(ctx context.Context, location string, metadata []QueueMetadata) (int, error) {
 	entry := &QueueEntry{Location: location, Metadata: metadata}
 	conflicts := 0
 
@@ -333,7 +333,7 @@ func (p *queueProducer) enqueue(ctx context.Context, location string, metadata [
 	}
 }
 
-func (p *queueProducer) readManifest(ctx context.Context) (*manifest, *objstore.Version, error) {
+func (p *manifestEnqueuer) readManifest(ctx context.Context) (*manifest, *objstore.Version, error) {
 	result, err := p.store.Get(ctx, p.manifestPath)
 	if errors.Is(err, objstore.ErrNotFound) {
 		return emptyManifest(), nil, nil
@@ -348,6 +348,6 @@ func (p *queueProducer) readManifest(ctx context.Context) (*manifest, *objstore.
 	return m, &result.Version, nil
 }
 
-func (p *queueProducer) conflictRate() float64 {
+func (p *manifestEnqueuer) conflictRate() float64 {
 	return p.counter.conflictRate()
 }

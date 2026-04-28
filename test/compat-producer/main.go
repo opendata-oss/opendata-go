@@ -46,7 +46,7 @@ func main() {
 
 	store := objstore.NewS3(client, bucket)
 
-	config := buffer.WriterConfig{
+	config := buffer.ProducerConfig{
 		DataPathPrefix:    "ingest",
 		ManifestPath:      "ingest/manifest",
 		FlushInterval:     24 * time.Hour,
@@ -55,7 +55,7 @@ func main() {
 		BatchCompression:  compressionFromEnv(),
 	}
 
-	w := buffer.NewWriter(store, config)
+	p := buffer.NewProducer(store, config)
 
 	// Write 3 separate batches with known data.
 	batches := []struct {
@@ -77,16 +77,16 @@ func main() {
 	}
 
 	for i, b := range batches {
-		if _, err := w.Append(b.entries, b.metadata); err != nil {
+		if _, err := p.Append(b.entries, b.metadata); err != nil {
 			log.Fatalf("append batch %d failed: %v", i+1, err)
 		}
-		if err := w.Flush(ctx); err != nil {
+		if err := p.Flush(ctx); err != nil {
 			log.Fatalf("flush batch %d failed: %v", i+1, err)
 		}
 		fmt.Printf("produced batch %d (%d entries)\n", i+1, len(b.entries))
 	}
 
-	if err := w.Close(ctx); err != nil {
+	if err := p.Close(ctx); err != nil {
 		log.Fatalf("close failed: %v", err)
 	}
 
