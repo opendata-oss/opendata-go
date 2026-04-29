@@ -21,6 +21,7 @@ type exporterTelemetry struct {
 	bytesMarshaledTotal       metric.Int64Counter
 	metricsReceivedTotal      metric.Int64Counter
 	dataPointsReceivedTotal   metric.Int64Counter
+	logRecordsReceivedTotal   metric.Int64Counter
 	marshalDuration           metric.Float64Histogram
 	enqueueWaitDuration       metric.Float64Histogram
 	durableWaitDuration       metric.Float64Histogram
@@ -84,6 +85,13 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 	dataPointsReceivedTotal, err := meter.Int64Counter(
 		"opendataexporter.data_points_received_total",
 		metric.WithDescription("Total metric data points received by the OpenData exporter."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	logRecordsReceivedTotal, err := meter.Int64Counter(
+		"opendataexporter.log_records_received_total",
+		metric.WithDescription("Total log records received by the OpenData exporter."),
 	)
 	if err != nil {
 		return nil, err
@@ -213,6 +221,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		bytesMarshaledTotal:       bytesMarshaledTotal,
 		metricsReceivedTotal:      metricsReceivedTotal,
 		dataPointsReceivedTotal:   dataPointsReceivedTotal,
+		logRecordsReceivedTotal:   logRecordsReceivedTotal,
 		marshalDuration:           marshalDuration,
 		enqueueWaitDuration:       enqueueWaitDuration,
 		durableWaitDuration:       durableWaitDuration,
@@ -238,10 +247,15 @@ type componentTelemetrySettings struct {
 	meterProvider metric.MeterProvider
 }
 
-func (t *exporterTelemetry) recordRequestStart(ctx context.Context, metricCount, dataPointCount int) {
+func (t *exporterTelemetry) recordRequestStartMetrics(ctx context.Context, metricCount, dataPointCount int) {
 	t.requestsTotal.Add(ctx, 1)
 	t.metricsReceivedTotal.Add(ctx, int64(metricCount))
 	t.dataPointsReceivedTotal.Add(ctx, int64(dataPointCount))
+}
+
+func (t *exporterTelemetry) recordRequestStartLogs(ctx context.Context, logRecordCount int) {
+	t.requestsTotal.Add(ctx, 1)
+	t.logRecordsReceivedTotal.Add(ctx, int64(logRecordCount))
 }
 
 func (t *exporterTelemetry) recordMarshal(ctx context.Context, sizeBytes int, duration time.Duration) {
@@ -253,7 +267,7 @@ func (t *exporterTelemetry) recordEnqueueWait(ctx context.Context, duration time
 	t.enqueueWaitDuration.Record(ctx, duration.Seconds())
 }
 
-func (t *exporterTelemetry) recordDurableWait(ctx context.Context, duration time.Duration, err error, metricCount, dataPointCount, sizeBytes int) {
+func (t *exporterTelemetry) recordDurableWaitMetrics(ctx context.Context, duration time.Duration, err error, metricCount, dataPointCount, sizeBytes int) {
 	t.durableWaitDuration.Record(ctx, duration.Seconds(), metric.WithAttributes(resultAttr(err)))
 	if err != nil {
 		return
@@ -261,9 +275,26 @@ func (t *exporterTelemetry) recordDurableWait(ctx context.Context, duration time
 	if duration >= t.slowRequestThreshold {
 		t.logger.Warn(
 			"OpenData exporter request completed slowly",
+			zap.String("signal", "metrics"),
 			zap.Duration("duration", duration),
 			zap.Int("metrics", metricCount),
 			zap.Int("data_points", dataPointCount),
+			zap.Int("payload_bytes", sizeBytes),
+		)
+	}
+}
+
+func (t *exporterTelemetry) recordDurableWaitLogs(ctx context.Context, duration time.Duration, err error, logRecordCount, sizeBytes int) {
+	t.durableWaitDuration.Record(ctx, duration.Seconds(), metric.WithAttributes(resultAttr(err)))
+	if err != nil {
+		return
+	}
+	if duration >= t.slowRequestThreshold {
+		t.logger.Warn(
+			"OpenData exporter request completed slowly",
+			zap.String("signal", "logs"),
+			zap.Duration("duration", duration),
+			zap.Int("log_records", logRecordCount),
 			zap.Int("payload_bytes", sizeBytes),
 		)
 	}
