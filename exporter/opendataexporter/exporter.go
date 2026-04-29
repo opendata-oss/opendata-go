@@ -49,10 +49,6 @@ func newOpenDataExporterForSignal(cfg *Config, signalType uint8) *openDataExport
 	return exp
 }
 
-func newOpenDataExporterWithTelemetry(cfg *Config, telemetrySettings componentTelemetrySettings) (*openDataExporter, error) {
-	return newOpenDataExporterForSignalWithTelemetry(cfg, SignalTypeMetrics, telemetrySettings)
-}
-
 func newOpenDataExporterForSignalWithTelemetry(cfg *Config, signalType uint8, telemetrySettings componentTelemetrySettings) (*openDataExporter, error) {
 	if signalType != SignalTypeMetrics && signalType != SignalTypeLogs {
 		return nil, fmt.Errorf("unsupported signal type %d", signalType)
