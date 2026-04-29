@@ -14,6 +14,7 @@ import (
 	"github.com/opendata-oss/opendata-go/objstore"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.uber.org/zap"
 )
@@ -24,17 +25,24 @@ type storeFactory func(context.Context, ObjectStoreConfig) (objstore.ObjectStore
 
 type openDataExporter struct {
 	config       Config
-	marshaler    *pmetric.ProtoMarshaler
+	signalType   uint8
 	metadata     []byte
 	storeFactory storeFactory
 	telemetry    *exporterTelemetry
+
+	metricsMarshaler *pmetric.ProtoMarshaler
+	logsMarshaler    *plog.ProtoMarshaler
 
 	mu       sync.RWMutex
 	producer *buffer.Producer
 }
 
 func newOpenDataExporter(cfg *Config) *openDataExporter {
-	exp, err := newOpenDataExporterWithTelemetry(cfg, componentTelemetrySettings{})
+	return newOpenDataExporterForSignal(cfg, SignalTypeMetrics)
+}
+
+func newOpenDataExporterForSignal(cfg *Config, signalType uint8) *openDataExporter {
+	exp, err := newOpenDataExporterForSignalWithTelemetry(cfg, signalType, componentTelemetrySettings{})
 	if err != nil {
 		panic(err)
 	}
@@ -42,17 +50,31 @@ func newOpenDataExporter(cfg *Config) *openDataExporter {
 }
 
 func newOpenDataExporterWithTelemetry(cfg *Config, telemetrySettings componentTelemetrySettings) (*openDataExporter, error) {
+	return newOpenDataExporterForSignalWithTelemetry(cfg, SignalTypeMetrics, telemetrySettings)
+}
+
+func newOpenDataExporterForSignalWithTelemetry(cfg *Config, signalType uint8, telemetrySettings componentTelemetrySettings) (*openDataExporter, error) {
+	if signalType != SignalTypeMetrics && signalType != SignalTypeLogs {
+		return nil, fmt.Errorf("unsupported signal type %d", signalType)
+	}
 	telemetry, err := newExporterTelemetry(telemetrySettings, *cfg)
 	if err != nil {
 		return nil, err
 	}
-	return &openDataExporter{
+	exp := &openDataExporter{
 		config:       *cfg,
-		marshaler:    &pmetric.ProtoMarshaler{},
-		metadata:     EncodeMetadata(SignalTypeMetrics, PayloadEncodingOTLP),
+		signalType:   signalType,
+		metadata:     EncodeMetadata(signalType, PayloadEncodingOTLP),
 		storeFactory: newObjectStore,
 		telemetry:    telemetry,
-	}, nil
+	}
+	switch signalType {
+	case SignalTypeMetrics:
+		exp.metricsMarshaler = &pmetric.ProtoMarshaler{}
+	case SignalTypeLogs:
+		exp.logsMarshaler = &plog.ProtoMarshaler{}
+	}
+	return exp, nil
 }
 
 func (e *openDataExporter) Start(ctx context.Context, _ component.Host) error {
@@ -87,6 +109,7 @@ func (e *openDataExporter) Start(ctx context.Context, _ component.Host) error {
 	e.producer = buffer.NewProducer(store, producerConfig)
 	e.telemetry.logger.Info(
 		"Starting OpenData exporter",
+		zap.String("signal", signalLabel(e.signalType)),
 		zap.String("bucket", e.config.ObjectStore.Bucket),
 		zap.String("region", e.config.ObjectStore.Region),
 		zap.String("data_path_prefix", e.config.DataPathPrefix),
@@ -115,40 +138,85 @@ func (e *openDataExporter) Capabilities() consumer.Capabilities {
 }
 
 func (e *openDataExporter) ConsumeMetrics(ctx context.Context, md pmetric.Metrics) error {
+	if e.signalType != SignalTypeMetrics {
+		return fmt.Errorf("ConsumeMetrics called on %s exporter", signalLabel(e.signalType))
+	}
+
 	start := time.Now()
 	metricCount := md.MetricCount()
 	dataPointCount := md.DataPointCount()
-	e.telemetry.recordRequestStart(ctx, metricCount, dataPointCount)
+	e.telemetry.recordRequestStartMetrics(ctx, metricCount, dataPointCount)
 
 	marshalStart := time.Now()
-	buf, err := e.marshaler.MarshalMetrics(md)
+	buf, err := e.metricsMarshaler.MarshalMetrics(md)
 	if err != nil {
 		e.telemetry.recordFailure(ctx, "marshal", err)
 		return err
 	}
 	e.telemetry.recordMarshal(ctx, len(buf), time.Since(marshalStart))
 
+	err = e.appendAndAwait(ctx, buf)
+	e.telemetry.recordDurableWaitMetrics(ctx, time.Since(start), err, metricCount, dataPointCount, len(buf))
+	return err
+}
+
+func (e *openDataExporter) ConsumeLogs(ctx context.Context, ld plog.Logs) error {
+	if e.signalType != SignalTypeLogs {
+		return fmt.Errorf("ConsumeLogs called on %s exporter", signalLabel(e.signalType))
+	}
+
+	start := time.Now()
+	logRecordCount := ld.LogRecordCount()
+	e.telemetry.recordRequestStartLogs(ctx, logRecordCount)
+
+	marshalStart := time.Now()
+	buf, err := e.logsMarshaler.MarshalLogs(ld)
+	if err != nil {
+		e.telemetry.recordFailure(ctx, "marshal", err)
+		return err
+	}
+	e.telemetry.recordMarshal(ctx, len(buf), time.Since(marshalStart))
+
+	err = e.appendAndAwait(ctx, buf)
+	e.telemetry.recordDurableWaitLogs(ctx, time.Since(start), err, logRecordCount, len(buf))
+	return err
+}
+
+// appendAndAwait hands the marshaled payload to the producer and waits for it
+// to become durable. Shared by ConsumeMetrics and ConsumeLogs.
+func (e *openDataExporter) appendAndAwait(ctx context.Context, payload []byte) error {
 	e.mu.RLock()
 	producer := e.producer
 	e.mu.RUnlock()
 	if producer == nil {
-		e.telemetry.recordFailure(ctx, "start", errExporterNotStarted)
-		return errExporterNotStarted
+		err := errExporterNotStarted
+		e.telemetry.recordFailure(ctx, "start", err)
+		return err
 	}
 
 	enqueueStart := time.Now()
-	handle, err := producer.Append([][]byte{buf}, e.metadata)
+	handle, err := producer.Append([][]byte{payload}, e.metadata)
 	e.telemetry.recordEnqueueWait(ctx, time.Since(enqueueStart))
 	if err != nil {
 		e.telemetry.recordFailure(ctx, "enqueue", err)
 		return err
 	}
-	err = handle.Watcher.AwaitDurable(ctx)
-	if err != nil {
+	if err := handle.Watcher.AwaitDurable(ctx); err != nil {
 		e.telemetry.recordFailure(ctx, "durable_wait", err)
+		return err
 	}
-	e.telemetry.recordDurableWait(ctx, time.Since(start), err, metricCount, dataPointCount, len(buf))
-	return err
+	return nil
+}
+
+func signalLabel(signalType uint8) string {
+	switch signalType {
+	case SignalTypeMetrics:
+		return "metrics"
+	case SignalTypeLogs:
+		return "logs"
+	default:
+		return fmt.Sprintf("unknown(%d)", signalType)
+	}
 }
 
 func newObjectStore(ctx context.Context, cfg ObjectStoreConfig) (objstore.ObjectStore, error) {

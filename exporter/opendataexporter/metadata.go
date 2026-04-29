@@ -9,6 +9,8 @@ const (
 	MetadataVersion uint8 = 1
 	// SignalTypeMetrics identifies metrics payloads in OpenData queue metadata.
 	SignalTypeMetrics uint8 = 1
+	// SignalTypeLogs identifies logs payloads in OpenData queue metadata.
+	SignalTypeLogs uint8 = 2
 	// PayloadEncodingOTLP identifies OTLP protobuf-encoded payloads.
 	PayloadEncodingOTLP uint8 = 1
 )
