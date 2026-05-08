@@ -196,37 +196,58 @@ type Producer struct {
 	// Uploader. Unbuffered: with UploadConcurrency=1 the Encoder
 	// blocks on send until the Uploader picks up.
 	encodedCh chan *encodedBatch
+	// uploadCompletionCh carries upload outcomes (PUT result + the
+	// encoded batch's metadata) from the Uploader to the
+	// ManifestCommitter. Unbuffered: the Uploader blocks on send
+	// until the Committer picks up. Phase 3.5 (Migration Plan step
+	// 6).
+	uploadCompletionCh chan *uploadCompletion
 
 	rotatorDone     chan struct{}
 	encoderPoolDone chan struct{}
 	uploaderDone    chan struct{}
+	committerDone   chan struct{}
 	closeOnce       sync.Once
+}
+
+// uploadCompletion is what the Uploader signals to the
+// ManifestCommitter once the data object PUT has completed (success
+// or failure). The Committer holds these in an ordinal-indexed map
+// and drains them in monotonic order, coalescing up to
+// ManifestAppendBatchSize ready ordinals into one CAS round trip.
+type uploadCompletion struct {
+	eb       *encodedBatch
+	putError error // non-nil if the PUT failed; the committer skips the ordinal but resolves watchers
 }
 
 // NewProducer creates a new Producer backed by the given ObjectStore.
 //
 // Spawns one Rotator goroutine + EncodeConcurrency Encoder goroutines
-// + one Uploader goroutine. See
+// + UploadConcurrency Uploader goroutines + one ManifestCommitter
+// goroutine. See
 // `plans/odb-high-throughput/phase03-producer-pipelining-design.md`
 // for the pipeline contract.
 func NewProducer(store objstore.ObjectStore, config ProducerConfig) *Producer {
 	enqueuer := newManifestEnqueuer(store, config.ManifestPath)
 	p := &Producer{
-		enqueuer:        enqueuer,
-		store:           store,
-		config:          config,
-		runID:           ulid.Make().String(),
-		appendCh:        make(chan *appendMessage, config.MaxBufferedInputs),
-		flushCh:         make(chan *flushMessage),
-		pendingCh:       make(chan *pendingBatch),
-		encodedCh:       make(chan *encodedBatch),
-		rotatorDone:     make(chan struct{}),
-		encoderPoolDone: make(chan struct{}),
-		uploaderDone:    make(chan struct{}),
+		enqueuer:           enqueuer,
+		store:              store,
+		config:             config,
+		runID:              ulid.Make().String(),
+		appendCh:           make(chan *appendMessage, config.MaxBufferedInputs),
+		flushCh:            make(chan *flushMessage),
+		pendingCh:          make(chan *pendingBatch),
+		encodedCh:          make(chan *encodedBatch),
+		uploadCompletionCh: make(chan *uploadCompletion),
+		rotatorDone:        make(chan struct{}),
+		encoderPoolDone:    make(chan struct{}),
+		uploaderDone:       make(chan struct{}),
+		committerDone:      make(chan struct{}),
 	}
 	go p.rotator()
 	go p.encoderPool()
 	go p.uploader()
+	go p.manifestCommitter()
 	return p
 }
 
@@ -416,17 +437,21 @@ func (p *Producer) encoder() {
 	}
 }
 
-// uploader consumes encodedBatch values from encodedCh and runs the
-// PUT + manifest CAS + watcher-resolve sequence. See design §3.S3
-// (PUT), §3.S4 fused (manifest CAS), §3.S5 fused (watcher resolve).
-// 3.5 splits ManifestCommitter out; 3.6 splits WatcherResolver out.
+// uploader consumes encodedBatch values from encodedCh, runs the
+// data-object PUT, and signals the result to the ManifestCommitter
+// via uploadCompletionCh. See design §3.S3.
 //
-// Single goroutine in Phase 3.4 (UploadConcurrency=1 default).
-// OnFlush duration measures from pipelineStartedAt (when the encoder
-// began processing this batch) through manifest commit, preserving
-// the pre-Phase-3 "writeAndEnqueue duration" semantic.
+// Single goroutine in Phase 3.5 (UploadConcurrency=1 default; opting
+// into >1 is structurally fine because the ManifestCommitter
+// re-orders by ordinal). PUT success and PUT failure both flow
+// through uploadCompletionCh — failures carry a non-nil putError so
+// the committer can skip the ordinal in the manifest sequence and
+// resolve the batch's watchers with the error.
+//
+// 3.6 will split the WatcherResolver out of the committer.
 func (p *Producer) uploader() {
 	defer close(p.uploaderDone)
+	defer close(p.uploadCompletionCh)
 
 	for eb := range p.encodedCh {
 		ctx := context.Background()
@@ -437,25 +462,147 @@ func (p *Producer) uploader() {
 		}
 		if err != nil {
 			err = storageErr(err.Error())
-		} else {
-			manifestStart := time.Now()
-			var conflicts int
-			conflicts, err = p.enqueuer.enqueue(ctx, eb.location, eb.metadata)
-			if p.config.Observer != nil {
-				p.config.Observer.OnManifestEnqueue(len(eb.metadata), time.Since(manifestStart), conflicts, err)
-			}
 		}
+		// Always signal the committer — even on PUT failure — so
+		// the committer can resolve the batch's watchers and skip
+		// the ordinal in the manifest sequence. Blocking send
+		// gives natural backpressure: while the committer is busy
+		// running a CAS, the uploader stops PUTing.
+		p.uploadCompletionCh <- &uploadCompletion{eb: eb, putError: err}
+	}
+}
 
+// manifestCommitter drains upload completions in monotonic ordinal
+// order, coalesces up to ManifestAppendBatchSize ready ordinals into
+// one CAS round trip, resolves watchers, and signals flush waiters.
+// Single goroutine per design §3.S4 — manifest mutation is
+// serialized through one owner.
+//
+// Ordinal ordering: the Uploader may send completions in any order
+// (with UploadConcurrency>1, faster uploads finish first). The
+// committer holds them in an ordinal-indexed map and drains
+// contiguous runs starting from the next-expected ordinal. With
+// UploadConcurrency=1 (Phase 3.5 default) completions arrive in
+// order, so the map holds at most one item at a time.
+//
+// PUT-failure handling: an ordinal whose PUT failed is skipped in
+// the manifest sequence (no entry written, no committed sequence
+// assigned). Its watchers are resolved with the putError before the
+// committer moves on. Ordinal monotonicity is preserved because
+// the committer always advances its `next-expected` cursor by 1
+// regardless of whether the ordinal contributed an entry to the
+// CAS group.
+//
+// Coalescing: at ManifestAppendBatchSize=1 (Phase 3.5 default),
+// every contiguous run of length 1 results in one CAS — same shape
+// as pre-Phase-3 behavior. The structure (multi-item enqueueBatch +
+// per-group watcher resolution + flushAck signaling) is exercised
+// even at size=1.
+func (p *Producer) manifestCommitter() {
+	defer close(p.committerDone)
+
+	type pendingResolution struct {
+		uc  *uploadCompletion
+		err error // result to resolve watchers with (CAS err, putError, or nil on success)
+	}
+
+	next := uint64(0)
+	ready := make(map[uint64]*uploadCompletion)
+	batchSize := p.config.ManifestAppendBatchSize
+	if batchSize < 1 {
+		batchSize = 1
+	}
+
+	resolve := func(uc *uploadCompletion, err error) {
 		if p.config.Observer != nil {
-			p.config.Observer.OnFlush(eb.reason, eb.stats, time.Since(eb.pipelineStartedAt), err)
+			p.config.Observer.OnFlush(
+				uc.eb.reason,
+				uc.eb.stats,
+				time.Since(uc.eb.pipelineStartedAt),
+				err,
+			)
 		}
-		for _, dw := range eb.watchers {
+		for _, dw := range uc.eb.watchers {
 			dw.resolve(err)
 		}
-		if eb.flushAck != nil {
-			eb.flushAck <- err
+		if uc.eb.flushAck != nil {
+			uc.eb.flushAck <- err
 		}
 	}
+
+	drain := func() {
+		// Drain contiguous ordinals starting at `next`, building one
+		// commit group of up to `batchSize` items. PUT-failed
+		// ordinals are skipped from the CAS itself but still consume
+		// a slot in the next-expected sequence (their watchers are
+		// resolved with the putError outside the CAS group).
+		for {
+			var group []*uploadCompletion
+			var failed []pendingResolution
+
+			for len(group)+len(failed) < batchSize {
+				uc, ok := ready[next]
+				if !ok {
+					break
+				}
+				delete(ready, next)
+				next++
+				if uc.putError != nil {
+					failed = append(failed, pendingResolution{uc: uc, err: uc.putError})
+				} else {
+					group = append(group, uc)
+				}
+			}
+
+			if len(group) == 0 && len(failed) == 0 {
+				return
+			}
+
+			var casErr error
+			if len(group) > 0 {
+				items := make([]enqueueItem, 0, len(group))
+				for _, uc := range group {
+					items = append(items, enqueueItem{
+						Location: uc.eb.location,
+						Metadata: uc.eb.metadata,
+					})
+				}
+				ctx := context.Background()
+				manifestStart := time.Now()
+				var conflicts int
+				conflicts, casErr = p.enqueuer.enqueueBatch(ctx, items)
+				if p.config.Observer != nil {
+					totalMeta := 0
+					for _, it := range items {
+						totalMeta += len(it.Metadata)
+					}
+					p.config.Observer.OnManifestEnqueue(totalMeta, time.Since(manifestStart), conflicts, casErr)
+				}
+			}
+
+			for _, uc := range group {
+				resolve(uc, casErr)
+			}
+			for _, pr := range failed {
+				resolve(pr.uc, pr.err)
+			}
+		}
+	}
+
+	for uc := range p.uploadCompletionCh {
+		ready[uc.eb.ordinal] = uc
+		drain()
+	}
+	// uploadCompletionCh closed: drain any straggling ordinals (with
+	// UploadConcurrency=1, ready is empty here since drain() runs
+	// after each completion; with >1, there may be holes if the
+	// upstream stages aborted mid-flight, in which case the
+	// committer simply returns without committing the orphaned
+	// ordinals — their watchers were never resolved, which signals
+	// shutdown to AwaitDurable callers via the goroutine eventually
+	// dropping. This matches the pre-Phase-3 partial-shutdown
+	// semantics).
+	drain()
 }
 
 // Append submits entries and associated metadata for buffering.
@@ -501,7 +648,10 @@ func (p *Producer) Flush(ctx context.Context) error {
 	select {
 	case err := <-fm.result:
 		return err
-	case <-p.uploaderDone:
+	case <-p.committerDone:
+		// Pipeline torn down before the manifest commit — the
+		// flushed batch's watchers were never resolved with a real
+		// outcome.
 		return ErrShutdown
 	case <-ctx.Done():
 		return ctx.Err()
@@ -522,6 +672,7 @@ func (p *Producer) Close(ctx context.Context) error {
 		<-p.rotatorDone
 		<-p.encoderPoolDone
 		<-p.uploaderDone
+		<-p.committerDone
 	})
 	return err
 }

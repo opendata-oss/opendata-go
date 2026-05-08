@@ -298,10 +298,32 @@ func newManifestEnqueuer(store objstore.ObjectStore, manifestPath string) *manif
 	}
 }
 
-// enqueue appends a queue entry to the manifest. Retries automatically on
-// optimistic concurrency conflicts.
+// enqueueItem is one entry to append in a coalesced CAS round trip.
+// Phase 3.5 introduces this so the ManifestCommitter can append up to
+// ManifestAppendBatchSize ordinals atomically.
+type enqueueItem struct {
+	Location string
+	Metadata []QueueMetadata
+}
+
+// enqueue appends a single queue entry. Backwards-compatible wrapper
+// over enqueueBatch.
 func (p *manifestEnqueuer) enqueue(ctx context.Context, location string, metadata []QueueMetadata) (int, error) {
-	entry := &QueueEntry{Location: location, Metadata: metadata}
+	return p.enqueueBatch(ctx, []enqueueItem{{Location: location, Metadata: metadata}})
+}
+
+// enqueueBatch appends N queue entries to the manifest in **one** CAS
+// round trip, retrying automatically on optimistic concurrency
+// conflicts. All items succeed together or none do — there is no
+// partial-CAS state visible to readers.
+//
+// Returns the number of CAS conflicts that were retried before
+// succeeding (or the final error). Zero items is a no-op (returns 0,
+// nil).
+func (p *manifestEnqueuer) enqueueBatch(ctx context.Context, items []enqueueItem) (int, error) {
+	if len(items) == 0 {
+		return 0, nil
+	}
 	conflicts := 0
 
 	for {
@@ -310,8 +332,14 @@ func (p *manifestEnqueuer) enqueue(ctx context.Context, location string, metadat
 			return conflicts, err
 		}
 
-		if err := m.append(entry); err != nil {
-			return conflicts, err
+		for i := range items {
+			entry := &QueueEntry{
+				Location: items[i].Location,
+				Metadata: items[i].Metadata,
+			}
+			if err := m.append(entry); err != nil {
+				return conflicts, err
+			}
 		}
 
 		data, err := m.toBytes()
