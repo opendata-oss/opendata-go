@@ -143,7 +143,7 @@ func runExporterIteration(ctx context.Context, iter int, a args) (*iterationResu
 	}
 
 	type pending struct {
-		watcher *buffer.DurabilityWatcher
+		watcher  *buffer.DurabilityWatcher
 		stagedAt time.Time
 	}
 	pendings := make([]pending, 0, a.batches)
@@ -162,28 +162,34 @@ func runExporterIteration(ctx context.Context, iter int, a args) (*iterationResu
 		}
 		totalRecords += len(entries)
 
-		// Stage 2: enqueue — Producer.Append (returns when message is
-		// queued to the background batch writer).
-		t1 := time.Now()
+		// Stage 2: enqueue — Producer.Append (returns when the message
+		// is queued to the background batch writer). stagedAt is the
+		// "exporter handed bytes off" timestamp; await_durable below
+		// measures end-to-end durable latency from this point.
+		stagedAt := time.Now()
 		h, err := p.Append(entries, nil)
 		if err != nil {
 			return nil, fmt.Errorf("Append: %w", err)
 		}
-		stages["enqueue"] = append(stages["enqueue"], time.Since(t1).Seconds())
+		stages["enqueue"] = append(stages["enqueue"], time.Since(stagedAt).Seconds())
 
-		pendings = append(pendings, pending{watcher: h.Watcher, stagedAt: time.Now()})
+		pendings = append(pendings, pending{watcher: h.Watcher, stagedAt: stagedAt})
 	}
 
-	// Stage 3: await_durable — block until each batch's flush completes.
-	if err := p.Flush(ctx); err != nil {
-		return nil, fmt.Errorf("Flush: %w", err)
-	}
+	// Stage 3: await_durable — end-to-end durable latency from the
+	// per-batch stagedAt (Append-call moment) to durability resolution.
+	// We do NOT pre-Flush here: with FlushSizeBytes=1, the producer's
+	// background writer flushes each batch automatically; pre-Flushing
+	// would race the timing window and report ~zero. Flush after the
+	// loop catches any unflushed remainder (defensive; should be empty).
 	for _, pn := range pendings {
-		t2 := time.Now()
 		if err := pn.watcher.AwaitDurable(ctx); err != nil {
 			return nil, fmt.Errorf("AwaitDurable: %w", err)
 		}
-		stages["await_durable"] = append(stages["await_durable"], time.Since(t2).Seconds())
+		stages["await_durable"] = append(stages["await_durable"], time.Since(pn.stagedAt).Seconds())
+	}
+	if err := p.Flush(ctx); err != nil {
+		return nil, fmt.Errorf("Flush: %w", err)
 	}
 
 	if err := p.Close(ctx); err != nil {
@@ -217,6 +223,7 @@ func runProducerIteration(ctx context.Context, iter int, a args) (*iterationResu
 	sandbox := objstore.NewInMemory()
 	stages := map[string][]float64{
 		"encode":          {},
+		"compress":        {},
 		"object_put":      {},
 		"manifest_append": {}, // populated below
 		"append_total":    {},
@@ -238,6 +245,13 @@ func runProducerIteration(ctx context.Context, iter int, a args) (*iterationResu
 			return nil, fmt.Errorf("EncodeBatch: %w", err)
 		}
 		stages["encode"] = append(stages["encode"], time.Since(t0).Seconds())
+
+		// `compress` stage: EncodeBatch with CompressionNone is a no-op
+		// for compression. Recording 0 keeps the schema-required stage
+		// present; future runs with batch_compression != none will time
+		// EncodeBatch in two passes (raw vs compressed) to extract the
+		// compression-only delta.
+		stages["compress"] = append(stages["compress"], 0.0)
 
 		t1 := time.Now()
 		if err := sandbox.Put(ctx, fmt.Sprintf("bench-1.2/iter-%d/sandbox/batch-%08d", iter, batchIdx), payload); err != nil {
@@ -419,7 +433,7 @@ var unitTable = map[string]unitMeta{
 	"1.2": {
 		id:          "1.2",
 		title:       "Benchmark current Go Buffer producer encode, S3/MinIO put, manifest append",
-		stages:      []string{"encode", "object_put", "manifest_append"},
+		stages:      []string{"encode", "compress", "object_put", "manifest_append"},
 		scalarNames: []string{"total_throughput_records_per_sec", "manifest_cas_conflict_rate"},
 	},
 }
