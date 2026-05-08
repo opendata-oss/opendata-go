@@ -993,3 +993,365 @@ func TestProducer_Flush_waits_for_in_flight_size_triggered_batch(t *testing.T) {
 		t.Fatalf("watcher AwaitDurable: %v", err)
 	}
 }
+
+// recordingObserver records the per-hook calls a test cares about.
+// Used by the rev-4 regression tests to assert specific hooks fire
+// with the right values. All other hooks no-op.
+type recordingObserver struct {
+	mu             sync.Mutex
+	inflightBytes  []int64
+	inflightBatch  []int
+	queueDepth     map[PipelineStage][]int
+	batchOutcomes  []BatchOutcome
+	flushDurations []time.Duration
+}
+
+func newRecordingObserver() *recordingObserver {
+	return &recordingObserver{queueDepth: map[PipelineStage][]int{}}
+}
+
+func (o *recordingObserver) OnAccepted()                                        {}
+func (o *recordingObserver) OnStorePut(int, time.Duration, error)               {}
+func (o *recordingObserver) OnManifestEnqueue(int, time.Duration, int, error)   {}
+func (o *recordingObserver) OnAppendChBlock(time.Duration)                      {}
+func (o *recordingObserver) OnWorkersBusy(PipelineStage, int)                   {}
+func (o *recordingObserver) OnEncodeDuration(time.Duration, error)              {}
+func (o *recordingObserver) OnUploadDuration(time.Duration, int, error)         {}
+func (o *recordingObserver) OnManifestAppendBatchSize(int)                      {}
+func (o *recordingObserver) OnManifestAppendDuration(time.Duration, int, error) {}
+func (o *recordingObserver) OnHeadOfLineBlock(time.Duration)                    {}
+func (o *recordingObserver) OnHalted(bool)                                      {}
+func (o *recordingObserver) OnFlush(_ FlushReason, _ FlushStats, d time.Duration, _ error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.flushDurations = append(o.flushDurations, d)
+}
+func (o *recordingObserver) OnBatchOutcome(outcome BatchOutcome) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.batchOutcomes = append(o.batchOutcomes, outcome)
+}
+func (o *recordingObserver) OnInflightBytes(b int64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.inflightBytes = append(o.inflightBytes, b)
+}
+func (o *recordingObserver) OnInflightBatches(b int) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.inflightBatch = append(o.inflightBatch, b)
+}
+func (o *recordingObserver) OnQueueDepth(stage PipelineStage, depth int) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.queueDepth[stage] = append(o.queueDepth[stage], depth)
+}
+
+func (o *recordingObserver) maxInflightBytes() int64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	var m int64
+	for _, b := range o.inflightBytes {
+		if b > m {
+			m = b
+		}
+	}
+	return m
+}
+
+func (o *recordingObserver) maxInflightBatches() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	var m int
+	for _, b := range o.inflightBatch {
+		if b > m {
+			m = b
+		}
+	}
+	return m
+}
+
+func (o *recordingObserver) outcomeCounts() map[BatchOutcome]int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	out := map[BatchOutcome]int{}
+	for _, o2 := range o.batchOutcomes {
+		out[o2]++
+	}
+	return out
+}
+
+func (o *recordingObserver) queueDepthStages() []PipelineStage {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	out := make([]PipelineStage, 0, len(o.queueDepth))
+	for s := range o.queueDepth {
+		out = append(out, s)
+	}
+	return out
+}
+
+// TestProducer_inflight_gauges_emit_on_acquire is the F1 (rev-4)
+// regression test. The rev-3 implementation only emitted
+// `buffer.producer.inflight_bytes` / `inflight_batches` on the
+// resolver-side release path, so a stuck upload would never produce
+// a positive gauge sample (gauge stays at 0, then snaps to 0 on
+// release). The fix emits a snapshot at every budget mutation:
+// AppendContext byte reservation, rotator batch-slot acquire,
+// rotator framed-byte addReservation, and resolver release.
+//
+// This test holds the upload via choreographableStore so the batch
+// is parked in flight, then asserts that the recordingObserver has
+// seen positive inflight gauge samples.
+func TestProducer_inflight_gauges_emit_on_acquire(t *testing.T) {
+	store := newChoreographableStore()
+	obs := newRecordingObserver()
+
+	cfg := testConfig()
+	cfg.FlushSizeBytes = 1
+	cfg.Observer = obs
+	p := NewProducer(store, cfg)
+	defer func() { _ = p.Close(context.Background()) }()
+
+	prefix := cfg.DataPathPrefix + "/" + p.runID + "/"
+
+	if _, err := p.Append([][]byte{[]byte("entry")}, []byte("md")); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	if !store.waitForObserved(prefix, 1, 5*time.Second) {
+		t.Fatalf("PUT never observed; the size-triggered batch did not reach the uploader")
+	}
+
+	// At this point: one batch is parked in the uploader. The budget
+	// snapshot should reflect the in-flight state.
+	if maxBytes := obs.maxInflightBytes(); maxBytes <= 0 {
+		t.Fatalf("expected positive max OnInflightBytes sample while a batch is in flight, got %d", maxBytes)
+	}
+	if maxBatches := obs.maxInflightBatches(); maxBatches < 1 {
+		t.Fatalf("expected max OnInflightBatches >= 1 while a batch is in flight, got %d", maxBatches)
+	}
+
+	// Release so Close can drain.
+	for _, p := range store.observedPaths() {
+		store.releasePut(p)
+	}
+}
+
+// TestProducer_byte_budget_charges_framing_overhead is the F2 (rev-4)
+// regression test for framed byte-budget reconciliation. A workload
+// of N tiny entries should charge the budget for the encoder's framed
+// allocation: sum(len(entries)) + len(metadata) + batchEntryLenSize*N
+// + batchFooterSize, not just sum(len(entries)) + len(metadata).
+//
+// The choreographable store holds the PUT so the batch stays in
+// flight while we sample the inflight-bytes gauge. The peak sample
+// must reach the framed cost, proving rotation reconciled correctly.
+func TestProducer_byte_budget_charges_framing_overhead(t *testing.T) {
+	const numEntries = 16
+	store := newChoreographableStore()
+	obs := newRecordingObserver()
+
+	cfg := testConfig()
+	cfg.Observer = obs
+	cfg.FlushSizeBytes = 1024 * 1024 // size won't trigger; we'll Flush
+	p := NewProducer(store, cfg)
+	defer func() { _ = p.Close(context.Background()) }()
+
+	entries := make([][]byte, numEntries)
+	for i := range entries {
+		entries[i] = []byte{byte(i)}
+	}
+	metadata := []byte("md")
+	if _, err := p.Append(entries, metadata); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	// Drive a manual Flush in a goroutine — the rotator's emit reconciles
+	// to framed cost before sending downstream, then the upload parks.
+	flushDone := make(chan error, 1)
+	go func() {
+		flushDone <- p.Flush(context.Background())
+	}()
+
+	prefix := cfg.DataPathPrefix + "/" + p.runID + "/"
+	if !store.waitForObserved(prefix, 1, 5*time.Second) {
+		t.Fatalf("PUT never observed; rotation did not reach the uploader")
+	}
+
+	// At this point the batch is parked in the uploader and the
+	// framed reservation is active. Compute the expected framed cost.
+	rawBytes := int64(numEntries) + int64(len(metadata))
+	framingExtra := int64(batchEntryLenSize)*int64(numEntries) + int64(batchFooterSize)
+	wantFramed := rawBytes + framingExtra
+
+	gotMax := obs.maxInflightBytes()
+	if gotMax < wantFramed {
+		t.Fatalf("max OnInflightBytes = %d, want >= %d (raw %d + framing %d); rotation reconciliation regressed",
+			gotMax, wantFramed, rawBytes, framingExtra)
+	}
+
+	// Release so Flush + Close can drain.
+	for _, p := range store.observedPaths() {
+		store.releasePut(p)
+	}
+	if err := <-flushDone; err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
+// TestProducer_encode_failure_advances_committer_past_ordinal is the
+// F3 (rev-4) regression test. The rev-3 fix routes encode failures
+// through uploadCompletionCh as synthetic completions so the
+// committer's `next` cursor advances past the failed ordinal. Without
+// this fix, a single encode-failed ordinal would block all later
+// successful batches in the committer's ready[] map.
+//
+// We choreograph mixed encode pass/fail via the test-only encodeFn
+// hook: ordinal 0 fails, ordinals 1-2 succeed. With the fix: all
+// three watchers resolve, manifest contains 2 entries (sequences 0
+// and 1, since ordinal 0 was skipped). Without the fix: the two
+// successful ordinals are stuck in the committer's ready[] map and
+// their watchers never resolve.
+func TestProducer_encode_failure_advances_committer_past_ordinal(t *testing.T) {
+	store := objstore.NewInMemory()
+	cfg := testConfig()
+	cfg.FlushSizeBytes = 1 // each Append → its own batch
+
+	p := NewProducer(store, cfg)
+	// Inject: fail the first call to encode, then pass through.
+	var calls atomic.Int64
+	p.encodeFn = func(entries [][]byte, comp CompressionType) ([]byte, error) {
+		if calls.Add(1) == 1 {
+			return nil, errors.New("synthetic encode failure")
+		}
+		return EncodeBatch(entries, comp)
+	}
+	defer func() { _ = p.Close(context.Background()) }()
+
+	const n = 3
+	handles := make([]*WriteHandle, n)
+	for i := 0; i < n; i++ {
+		h, err := p.Append([][]byte{{byte(i)}}, []byte("md"))
+		if err != nil {
+			t.Fatalf("Append[%d]: %v", i, err)
+		}
+		handles[i] = h
+	}
+
+	// All three watchers must resolve within a tight bound. Without
+	// the F3 fix, watchers 1 and 2 stay blocked because their
+	// successful uploads sit behind the missing ordinal in the
+	// committer's ready[] map.
+	deadline := time.Now().Add(10 * time.Second)
+	for i, h := range handles {
+		ctx, cancel := context.WithDeadline(context.Background(), deadline)
+		err := h.Watcher.AwaitDurable(ctx)
+		cancel()
+		if i == 0 {
+			if err == nil || err.Error() != "synthetic encode failure" {
+				t.Fatalf("watcher[0] = %v, want \"synthetic encode failure\"", err)
+			}
+		} else {
+			if err != nil {
+				t.Fatalf("watcher[%d] = %v, want nil (committer should advance past ordinal 0)", i, err)
+			}
+		}
+	}
+
+	// Manifest should contain exactly two entries (the two successful
+	// ordinals). Sequences are assigned by the manifest in append
+	// order, so they are 0 and 1.
+	entries := readManifestEntries(t, store)
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 manifest entries (ordinals 1+2 succeeded; ordinal 0 skipped), got %d", len(entries))
+	}
+	for i, e := range entries {
+		if e.Sequence != uint64(i) {
+			t.Fatalf("entries[%d].Sequence = %d, want %d", i, e.Sequence, i)
+		}
+	}
+}
+
+// TestProducer_OnQueueDepth_fires_per_stage is the F4 (rev-4)
+// regression test for the queue_depth observer hook. A successful
+// batch through the pipeline must fire OnQueueDepth at the four
+// stage handoffs: append (AppendContext), encode (rotator → encoder),
+// upload (encoder → uploader), commit (uploader → committer).
+func TestProducer_OnQueueDepth_fires_per_stage(t *testing.T) {
+	store := objstore.NewInMemory()
+	obs := newRecordingObserver()
+	cfg := testConfig()
+	cfg.Observer = obs
+	cfg.FlushSizeBytes = 1
+	p := NewProducer(store, cfg)
+	defer func() { _ = p.Close(context.Background()) }()
+
+	h, err := p.Append([][]byte{[]byte("entry")}, []byte("md"))
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := h.Watcher.AwaitDurable(context.Background()); err != nil {
+		t.Fatalf("AwaitDurable: %v", err)
+	}
+
+	got := map[PipelineStage]bool{}
+	for _, s := range obs.queueDepthStages() {
+		got[s] = true
+	}
+	want := []PipelineStage{StageAppend, StageEncode, StageUpload, StageCommit}
+	for _, s := range want {
+		if !got[s] {
+			t.Errorf("OnQueueDepth never fired for stage %q", s)
+		}
+	}
+}
+
+// TestNewProducer_applies_retry_defaults_to_literal_config is the
+// F6 (rev-4) regression test. A ProducerConfig literal that omits
+// the retry-budget fields must inherit DefaultUploadMaxAttempts /
+// DefaultManifestMaxAttempts (both 6) so retries actually happen.
+// Without the fix, NewProducer left them at 0 and the inner
+// putWithRetry / casWithRetry treated 0 as "1 attempt" — i.e. no
+// retry budget at all.
+//
+// We assert by counting PUT calls under a faulty store that fails
+// the first two attempts. With the default budget (6), the third
+// attempt succeeds and the watcher resolves nil. Without the fix
+// (1 attempt), the first failure becomes terminal.
+func TestNewProducer_applies_retry_defaults_to_literal_config(t *testing.T) {
+	store := newFaultyStore()
+	store.failPutErr = errors.New("transient PUT error")
+	store.failPutCount.Store(2)
+
+	// Construct a ProducerConfig literal — note: no UploadMaxAttempts
+	// / UploadInitialBackoff / Manifest* values. testConfig() has the
+	// same shape, but to be unambiguous we build a literal here.
+	cfg := ProducerConfig{
+		DataPathPrefix:    "test-ingest",
+		ManifestPath:      "test/manifest",
+		FlushInterval:     24 * time.Hour,
+		FlushSizeBytes:    1,
+		MaxBufferedInputs: 16,
+		BatchCompression:  CompressionNone,
+	}
+	// Use a small backoff override only by injecting it via the
+	// applied-default path below — we still rely on NewProducer to
+	// apply the default attempts count. The default backoff is
+	// 100ms; the test tolerates that.
+	p := NewProducer(store, cfg)
+	defer func() { _ = p.Close(context.Background()) }()
+
+	h, err := p.Append([][]byte{[]byte("entry")}, nil)
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := h.Watcher.AwaitDurable(context.Background()); err != nil {
+		t.Fatalf("AwaitDurable: %v (retry defaults likely not applied — produced no retry budget)", err)
+	}
+	// Three calls: 2 fails + 1 success. Without the fix, only 1
+	// attempt is made and AwaitDurable returns the first error.
+	if got := store.putCalls.Load(); got < 3 {
+		t.Fatalf("expected >= 3 PUT calls (2 fail + 1 success); got %d. Retry defaults likely not applied to literal config.", got)
+	}
+}

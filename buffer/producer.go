@@ -275,6 +275,16 @@ type Producer struct {
 	// without attempting a CAS. F2 of Phase 3 rev-2 review.
 	halted       atomic.Bool
 	haltedNotify sync.Once // guards a one-time OnHalted(true) emit
+
+	// encodeFn is a fault-injection seam for buffer-internal tests.
+	// nil means use EncodeBatch (the production path). Set only by
+	// tests that need to choreograph mixed encode-success / encode-
+	// failure across ordinals — without this seam, the F3 path
+	// "encode failure advances committer past missing ordinal" can
+	// only be tested with all-bad batches, which doesn't differentiate
+	// the rev-3 fix from the rev-2 bypass behavior. F2 of Phase 3
+	// rev-4 review (test coverage). Production code must not set this.
+	encodeFn func(entries [][]byte, compression CompressionType) ([]byte, error)
 }
 
 // uploadCompletion is what the Uploader signals to the
@@ -449,6 +459,7 @@ func (p *Producer) rotator() {
 			// On shutdown, release the bytes the batch was holding
 			// since no resolver-side release will run for it.
 			p.budget.release(batch.byteCost, 0)
+			p.emitInflightSnapshot()
 			_, _, watchers, _ := batch.reset()
 			for _, dw := range watchers {
 				dw.resolve(ErrShutdown)
@@ -458,6 +469,11 @@ func (p *Producer) rotator() {
 			}
 			return
 		}
+		// Batch slot acquired — emit the inflight gauges so the
+		// design's `buffer.producer.inflight_batches` reflects the
+		// current state, not just the post-release state. F1 of
+		// Phase 3 rev-4 review.
+		p.emitInflightSnapshot()
 		stats := batch.stats()
 		entries, metadata, watchers, byteCost := batch.reset()
 		// Reconcile the per-message byte reservation to the
@@ -472,6 +488,7 @@ func (p *Producer) rotator() {
 		framingExtra := int64(batchEntryLenSize)*int64(len(entries)) + int64(batchFooterSize)
 		framedCost := byteCost + framingExtra
 		p.budget.addReservation(framingExtra)
+		p.emitInflightSnapshot()
 		pb := &pendingBatch{
 			ordinal:  ordinal,
 			entries:  entries,
@@ -605,7 +622,11 @@ func (p *Producer) encoder() {
 			p.config.Observer.OnWorkersBusy(StageEncode, int(busy))
 		}
 		encodeStart := time.Now()
-		payload, err := EncodeBatch(pb.entries, p.config.BatchCompression)
+		encodeFn := EncodeBatch
+		if p.encodeFn != nil {
+			encodeFn = p.encodeFn
+		}
+		payload, err := encodeFn(pb.entries, p.config.BatchCompression)
 		busy = p.encodeWorkersBusy.Add(-1)
 		if p.config.Observer != nil {
 			p.config.Observer.OnEncodeDuration(time.Since(encodeStart), err)
@@ -1105,12 +1126,25 @@ func (p *Producer) watcherResolver() {
 		// flow through the resolver, so this is the single release
 		// point. F1 of Phase 3 rev-2 review.
 		p.budget.release(ri.byteCost, 1)
-		if p.config.Observer != nil {
-			usedBytes, usedBatches := p.budget.snapshot()
-			p.config.Observer.OnInflightBytes(usedBytes)
-			p.config.Observer.OnInflightBatches(int(usedBatches))
-		}
+		p.emitInflightSnapshot()
 	}
+}
+
+// emitInflightSnapshot fires OnInflightBytes / OnInflightBatches with
+// the budget's current state. Called from every budget mutation site —
+// AppendContext byte reservation, rotator batch-slot acquire, rotator
+// framed-byte reconciliation, and resolver release — so the design's
+// "current in-flight" gauges (`buffer.producer.inflight_bytes` /
+// `inflight_batches`, design §Metrics) actually reflect the current
+// state. Without this, a stuck upload would never produce a positive
+// gauge sample, then emit 0 on release — F1 of Phase 3 rev-4 review.
+func (p *Producer) emitInflightSnapshot() {
+	if p.config.Observer == nil {
+		return
+	}
+	usedBytes, usedBatches := p.budget.snapshot()
+	p.config.Observer.OnInflightBytes(usedBytes)
+	p.config.Observer.OnInflightBatches(int(usedBatches))
 }
 
 // Append submits entries and associated metadata for buffering.
@@ -1158,6 +1192,10 @@ func (p *Producer) AppendContext(ctx context.Context, entries [][]byte, metadata
 	if err := p.budget.reserveBytes(ctx, byteCost, p.shutdownCh); err != nil {
 		return nil, err
 	}
+	// Bytes reserved — emit the inflight gauges so the design's
+	// `buffer.producer.inflight_bytes` reflects the current state.
+	// F1 of Phase 3 rev-4 review.
+	p.emitInflightSnapshot()
 
 	watcher := newDurabilityWatcher()
 	msg := &appendMessage{
@@ -1180,9 +1218,11 @@ func (p *Producer) AppendContext(ctx context.Context, entries [][]byte, metadata
 		// The reservation was held but the message never entered the
 		// pipeline; release it so a future Append can use the budget.
 		p.budget.release(byteCost, 0)
+		p.emitInflightSnapshot()
 		return nil, ctx.Err()
 	case <-p.rotatorDone:
 		p.budget.release(byteCost, 0)
+		p.emitInflightSnapshot()
 		return nil, ErrShutdown
 	}
 }
