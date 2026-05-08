@@ -414,3 +414,7 @@ func (t *exporterTelemetry) OnHeadOfLineBlock(time.Duration) {}
 func (t *exporterTelemetry) OnBatchOutcome(buffer.BatchOutcome) {}
 
 func (t *exporterTelemetry) OnHalted(bool) {}
+
+func (t *exporterTelemetry) OnInflightBytes(int64) {}
+
+func (t *exporterTelemetry) OnInflightBatches(int) {}

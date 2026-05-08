@@ -67,6 +67,12 @@ type appendMessage struct {
 	metadata        []byte
 	ingestionTimeMs int64
 	watcher         *DurabilityWatcher
+	// byteCost is the budget reservation made at AppendContext enqueue
+	// (`sum(len(entries)) + len(metadata)`). The rotator sums these
+	// into the emitted batch's `byteCost`; the WatcherResolver
+	// releases that batch total back to the budget on terminal
+	// outcome. F1 of Phase 3 rev-2 review.
+	byteCost int64
 }
 
 type flushMessage struct {
@@ -78,6 +84,11 @@ type batchAccumulator struct {
 	metadata  []QueueMetadata
 	watchers  []*DurabilityWatcher
 	sizeBytes int
+	// byteCost is the sum of per-message reservations from
+	// `AppendContext`. The rotator carries this onto the emitted
+	// `pendingBatch` so the WatcherResolver can release it back to
+	// the budget on terminal outcome. F1 of Phase 3 rev-2 review.
+	byteCost  int64
 	startedAt time.Time
 	started   bool
 }
@@ -96,6 +107,7 @@ func (b *batchAccumulator) add(msg *appendMessage) {
 		b.sizeBytes += len(e)
 	}
 	b.sizeBytes += len(msg.metadata)
+	b.byteCost += msg.byteCost
 
 	if !b.started {
 		b.startedAt = time.Now()
@@ -107,17 +119,19 @@ func (b *batchAccumulator) isEmpty() bool {
 	return len(b.entries) == 0
 }
 
-func (b *batchAccumulator) reset() ([][]byte, []QueueMetadata, []*DurabilityWatcher) {
-	entries := b.entries
-	metadata := b.metadata
-	watchers := b.watchers
+func (b *batchAccumulator) reset() (entries [][]byte, metadata []QueueMetadata, watchers []*DurabilityWatcher, byteCost int64) {
+	entries = b.entries
+	metadata = b.metadata
+	watchers = b.watchers
+	byteCost = b.byteCost
 
 	b.entries = nil
 	b.metadata = nil
 	b.watchers = nil
 	b.sizeBytes = 0
+	b.byteCost = 0
 	b.started = false
-	return entries, metadata, watchers
+	return entries, metadata, watchers, byteCost
 }
 
 func (b *batchAccumulator) stats() FlushStats {
@@ -151,6 +165,10 @@ type pendingBatch struct {
 	// to this channel after the watchers are resolved, so Flush can
 	// return the durable outcome to its caller.
 	flushAck chan error
+	// byteCost is the sum of `AppendContext`-time reservations for
+	// the messages in this batch. Released by the WatcherResolver
+	// on terminal outcome. F1 of Phase 3 rev-2 review.
+	byteCost int64
 }
 
 // encodedBatch is the unit of work the Encoder pool emits to the
@@ -168,6 +186,7 @@ type encodedBatch struct {
 	location          string // <data_path_prefix>/<runID>/<ordinal:016x>
 	size              int    // len(payload)
 	pipelineStartedAt time.Time
+	byteCost          int64 // budget reservation carried for release on terminal outcome
 }
 
 // Producer accepts opaque byte entries, batches them, and flushes to object
@@ -224,6 +243,17 @@ type Producer struct {
 	resolverDone     chan struct{}
 	closeOnce        sync.Once
 
+	// shutdownCh is closed when Close starts, signaling internal
+	// budget waits to give up early instead of blocking forever
+	// on capacity that won't return. F1 of Phase 3 rev-2 review.
+	shutdownCh chan struct{}
+
+	// budget enforces MaxInFlightBytes and MaxInFlightBatches per
+	// design §Backpressure. Reservations are made in AppendContext
+	// (bytes) and the rotator emit (batch slot); both released by
+	// the WatcherResolver on terminal outcome.
+	budget *producerBudget
+
 	// Phase 3.7 metrics state (atomic counters for `workers_busy`).
 	encodeWorkersBusy atomic.Int64
 	uploadWorkersBusy atomic.Int64
@@ -262,6 +292,11 @@ type resolverItem struct {
 	// used when the pipeline tears down before the batch terminates
 	// (not currently emitted; reserved for future use).
 	outcome BatchOutcome
+	// byteCost is what the WatcherResolver releases back to the
+	// budget on terminal outcome (commit or any failure). Always
+	// matches the corresponding pendingBatch / encodedBatch byteCost.
+	// F1 of Phase 3 rev-2 review.
+	byteCost int64
 }
 
 // NewProducer creates a new Producer backed by the given ObjectStore.
@@ -272,6 +307,18 @@ type resolverItem struct {
 // `plans/odb-high-throughput/phase03-producer-pipelining-design.md`
 // for the pipeline contract.
 func NewProducer(store objstore.ObjectStore, config ProducerConfig) *Producer {
+	// Apply defaults for the Phase-3 fields that may be unset when
+	// callers build a ProducerConfig literally (e.g. test code that
+	// pre-dates these knobs). This keeps the budget meaningful even
+	// for partial configs while still letting callers opt into
+	// tighter caps explicitly. Production code should call
+	// DefaultProducerConfig() and override.
+	if config.MaxInFlightBytes < 1 {
+		config.MaxInFlightBytes = DefaultMaxInFlightBytes
+	}
+	if config.MaxInFlightBatches < 1 {
+		config.MaxInFlightBatches = DefaultMaxInFlightBatches
+	}
 	enqueuer := newManifestEnqueuer(store, config.ManifestPath)
 	completionBuf := config.MaxInFlightBatches
 	if completionBuf < 1 {
@@ -293,6 +340,8 @@ func NewProducer(store objstore.ObjectStore, config ProducerConfig) *Producer {
 		uploaderPoolDone:   make(chan struct{}),
 		committerDone:      make(chan struct{}),
 		resolverDone:       make(chan struct{}),
+		shutdownCh:         make(chan struct{}),
+		budget:             newProducerBudget(config.MaxInFlightBytes, config.MaxInFlightBatches),
 	}
 	go p.rotator()
 	go p.encoderPool()
@@ -340,8 +389,28 @@ func (p *Producer) rotator() {
 			}
 			return
 		}
+		// Acquire one MaxInFlightBatches slot before the batch
+		// becomes pendingBatch. The slot is released by the
+		// WatcherResolver alongside the byte release. Returns
+		// ErrShutdown only if Close starts mid-wait, in which
+		// case the rotator drops the batch (its watchers will be
+		// resolved with ErrShutdown by the resolver via the close
+		// cascade) and exits. F1 of Phase 3 rev-2 review.
+		if err := p.budget.acquireBatchSlot(p.shutdownCh); err != nil {
+			// On shutdown, release the bytes the batch was holding
+			// since no resolver-side release will run for it.
+			p.budget.release(batch.byteCost, 0)
+			_, _, watchers, _ := batch.reset()
+			for _, dw := range watchers {
+				dw.resolve(ErrShutdown)
+			}
+			if flushAck != nil {
+				flushAck <- ErrShutdown
+			}
+			return
+		}
 		stats := batch.stats()
-		entries, metadata, watchers := batch.reset()
+		entries, metadata, watchers, byteCost := batch.reset()
 		pb := &pendingBatch{
 			ordinal:  ordinal,
 			entries:  entries,
@@ -350,6 +419,7 @@ func (p *Producer) rotator() {
 			stats:    stats,
 			reason:   reason,
 			flushAck: flushAck,
+			byteCost: byteCost,
 		}
 		ordinal++
 		// Blocks until an encoder picks it up. While blocked, this
@@ -481,7 +551,8 @@ func (p *Producer) encoder() {
 			// Encode failure: hand off to the WatcherResolver
 			// (Phase 3.6) instead of resolving inline. The
 			// resolver calls OnFlush, resolves watchers, and
-			// signals flushAck.
+			// signals flushAck. byteCost is carried so the
+			// resolver releases the budget reservation.
 			p.resolverCh <- &resolverItem{
 				reason:            pb.reason,
 				stats:             pb.stats,
@@ -490,6 +561,7 @@ func (p *Producer) encoder() {
 				flushAck:          pb.flushAck,
 				err:               err,
 				outcome:           OutcomeEncodeFailed,
+				byteCost:          pb.byteCost,
 			}
 			continue
 		}
@@ -504,6 +576,7 @@ func (p *Producer) encoder() {
 			location:          fmt.Sprintf("%s/%s/%016x", p.config.DataPathPrefix, p.runID, pb.ordinal),
 			size:              len(payload),
 			pipelineStartedAt: pipelineStartedAt,
+			byteCost:          pb.byteCost,
 		}
 		// Blocks until uploader takes it. With UploadConcurrency=1
 		// default this preserves single-flight throughput.
@@ -636,6 +709,7 @@ func (p *Producer) manifestCommitter() {
 			flushAck:          uc.eb.flushAck,
 			err:               err,
 			outcome:           outcome,
+			byteCost:          uc.eb.byteCost,
 		}
 	}
 
@@ -792,6 +866,17 @@ func (p *Producer) watcherResolver() {
 		if ri.flushAck != nil {
 			ri.flushAck <- ri.err
 		}
+		// Release the budget reservation for this batch (one batch
+		// slot + byteCost bytes). All terminal outcomes — commit
+		// success, encode failure, upload failure, manifest failure —
+		// flow through the resolver, so this is the single release
+		// point. F1 of Phase 3 rev-2 review.
+		p.budget.release(ri.byteCost, 1)
+		if p.config.Observer != nil {
+			usedBytes, usedBatches := p.budget.snapshot()
+			p.config.Observer.OnInflightBytes(usedBytes)
+			p.config.Observer.OnInflightBatches(int(usedBatches))
+		}
 	}
 }
 
@@ -813,6 +898,13 @@ func (p *Producer) Append(entries [][]byte, metadata []byte) (*WriteHandle, erro
 // enqueued, ctx cancellation does not affect the in-flight batch —
 // the watcher's AwaitDurable(ctx) is the cancellation point for
 // the durable wait.
+//
+// Backpressure: AppendContext reserves `sum(len(entries)) + len(metadata)`
+// bytes against `MaxInFlightBytes` *before* the appendCh send (F1 of
+// Phase 3 rev-2 review). The reservation is released by the
+// WatcherResolver on the eventual terminal outcome of whichever batch
+// includes this message. If `ctx` cancels during the byte wait, no
+// reservation is held and no message is enqueued.
 func (p *Producer) AppendContext(ctx context.Context, entries [][]byte, metadata []byte) (*WriteHandle, error) {
 	if len(entries) == 0 {
 		return nil, invalidInputErr("entries must not be empty")
@@ -821,15 +913,21 @@ func (p *Producer) AppendContext(ctx context.Context, entries [][]byte, metadata
 		metadata = []byte{}
 	}
 
+	byteCost := appendByteCost(entries, metadata)
+	blockStart := time.Now()
+	if err := p.budget.reserveBytes(ctx, byteCost, p.shutdownCh); err != nil {
+		return nil, err
+	}
+
 	watcher := newDurabilityWatcher()
 	msg := &appendMessage{
 		entries:         entries,
 		metadata:        metadata,
 		ingestionTimeMs: time.Now().UnixMilli(),
 		watcher:         watcher,
+		byteCost:        byteCost,
 	}
 
-	blockStart := time.Now()
 	select {
 	case p.appendCh <- msg:
 		if p.config.Observer != nil {
@@ -838,8 +936,12 @@ func (p *Producer) AppendContext(ctx context.Context, entries [][]byte, metadata
 		}
 		return &WriteHandle{Watcher: watcher}, nil
 	case <-ctx.Done():
+		// The reservation was held but the message never entered the
+		// pipeline; release it so a future Append can use the budget.
+		p.budget.release(byteCost, 0)
 		return nil, ctx.Err()
 	case <-p.rotatorDone:
+		p.budget.release(byteCost, 0)
 		return nil, ErrShutdown
 	}
 }

@@ -104,9 +104,17 @@ type Observer interface {
 
 	// OnHalted reports the producer entering or leaving the halted
 	// state (true = halted, false = healthy). Wired to the
-	// committer's "retry budget exhausted" path per design §Failure;
-	// the budget itself is implemented via ManifestMaxAttempts (set
-	// to 0 in Phase 3.7 to preserve infinite-retry behavior; non-zero
-	// behavior lands in a follow-up).
+	// committer's "retry budget exhausted" path per design §Failure.
 	OnHalted(halted bool)
+
+	// OnInflightBytes reports the current sum of bytes reserved
+	// against `MaxInFlightBytes` after a release event. Emitted
+	// once per terminal batch outcome from the WatcherResolver.
+	// F1 of Phase 3 rev-2 review.
+	OnInflightBytes(bytes int64)
+
+	// OnInflightBatches reports the current count of batches
+	// reserved against `MaxInFlightBatches` after a release event.
+	// Emitted alongside OnInflightBytes.
+	OnInflightBatches(batches int)
 }

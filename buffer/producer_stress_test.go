@@ -266,6 +266,15 @@ func (s *choreographableStore) releasePut(path string) {
 		ch = make(chan struct{})
 		s.pending[path] = ch
 	}
+	// Idempotent: a second releasePut for the same path is a no-op.
+	// Without this, tests that release a known path explicitly and
+	// then bulk-release the rest would double-close.
+	select {
+	case <-ch:
+		s.mu.Unlock()
+		return
+	default:
+	}
 	s.mu.Unlock()
 	close(ch)
 }
@@ -367,6 +376,156 @@ func TestProducer_uploads_complete_out_of_order(t *testing.T) {
 		if e.Location != paths[i] {
 			t.Fatalf("entries[%d].Location = %q, want %q", i, e.Location, paths[i])
 		}
+	}
+}
+
+// TestProducer_byte_budget_blocks_AppendContext_until_release exercises
+// F1 of the Phase 3 rev-2 review: `MaxInFlightBytes` must actually
+// gate `AppendContext`, not just sit in `ProducerConfig`. The first
+// Append fills the budget to the cap; the second Append's reservation
+// would exceed it and must block until a watcher resolves and the
+// resolver releases bytes back to the budget.
+//
+// Setup: tiny `MaxInFlightBytes` (smaller than two payloads). Hold
+// the upload PUT so the first batch never resolves on its own; the
+// test asserts that AppendContext is blocked, then releases the PUT,
+// confirms the watcher resolves, and finally confirms the second
+// AppendContext unblocks once the budget frees.
+func TestProducer_byte_budget_blocks_AppendContext_until_release(t *testing.T) {
+	store := newChoreographableStore()
+
+	// Each payload is 16 bytes (the byte slice). Cap budget at 16 so
+	// only one in flight at a time.
+	cfg := testConfig()
+	cfg.FlushSizeBytes = 1
+	cfg.MaxInFlightBytes = 16
+	cfg.MaxInFlightBatches = 64
+	p := NewProducer(store, cfg)
+	defer func() { _ = p.Close(context.Background()) }()
+
+	// First Append: the reservation fits (budget empty → oversize
+	// rule does not apply, but in this case 16-byte payload exactly
+	// equals the cap). Returns immediately.
+	h1, err := p.Append([][]byte{make([]byte, 16)}, nil)
+	if err != nil {
+		t.Fatalf("first Append: %v", err)
+	}
+
+	// Wait until the first batch's PUT is parked at the gate; that
+	// confirms the reservation has propagated through the pipeline
+	// and the budget is held until release.
+	prefix := cfg.DataPathPrefix + "/" + p.runID + "/"
+	if !store.waitForObserved(prefix, 1, 5*time.Second) {
+		t.Fatalf("first PUT never observed within 5s")
+	}
+
+	// Second Append in a goroutine: must block on the budget.
+	type result struct {
+		h   *WriteHandle
+		err error
+	}
+	res := make(chan result, 1)
+	go func() {
+		h, err := p.Append([][]byte{make([]byte, 16)}, nil)
+		res <- result{h, err}
+	}()
+
+	// Confirm the second Append is blocked (no result within a
+	// generous-but-bounded window).
+	select {
+	case r := <-res:
+		t.Fatalf("second Append unblocked too early; got h=%v err=%v", r.h, r.err)
+	case <-time.After(150 * time.Millisecond):
+		// Expected — the budget is full and the second Append is
+		// parked in reserveBytes.
+	}
+
+	// Release the first PUT. The first batch flows through the
+	// pipeline to the WatcherResolver, which releases the budget.
+	// The second AppendContext should then unblock.
+	paths := store.observedPaths()
+	store.releasePut(paths[0])
+
+	if err := h1.Watcher.AwaitDurable(context.Background()); err != nil {
+		t.Fatalf("first watcher: %v", err)
+	}
+
+	select {
+	case r := <-res:
+		if r.err != nil {
+			t.Fatalf("second Append: %v", r.err)
+		}
+		// Release its PUT too so the test's deferred Close() can
+		// drain cleanly.
+		if !store.waitForObserved(prefix, 2, 5*time.Second) {
+			t.Fatalf("second PUT never observed")
+		}
+		paths = store.observedPaths()
+		for _, p := range paths {
+			store.releasePut(p)
+		}
+		if err := r.h.Watcher.AwaitDurable(context.Background()); err != nil {
+			t.Fatalf("second watcher: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("second Append never unblocked after first batch resolved")
+	}
+}
+
+// TestProducer_byte_budget_AppendContext_returns_ctx_err_on_cancel
+// exercises the design's "AppendContext returns ctx.Err() when the
+// supplied context cancels" guarantee under budget pressure. Ensures
+// no leaked reservation: a subsequent AppendContext must succeed.
+func TestProducer_byte_budget_AppendContext_returns_ctx_err_on_cancel(t *testing.T) {
+	store := newChoreographableStore()
+
+	cfg := testConfig()
+	cfg.FlushSizeBytes = 1
+	cfg.MaxInFlightBytes = 16
+	cfg.MaxInFlightBatches = 64
+	p := NewProducer(store, cfg)
+	defer func() { _ = p.Close(context.Background()) }()
+
+	// Fill the budget with one held in-flight batch.
+	h1, err := p.Append([][]byte{make([]byte, 16)}, nil)
+	if err != nil {
+		t.Fatalf("first Append: %v", err)
+	}
+	prefix := cfg.DataPathPrefix + "/" + p.runID + "/"
+	if !store.waitForObserved(prefix, 1, 5*time.Second) {
+		t.Fatalf("first PUT never observed")
+	}
+
+	// AppendContext with a soon-to-cancel context: must return
+	// ctx.Err() once the context fires, leaving the budget unchanged.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := p.AppendContext(ctx, [][]byte{make([]byte, 16)}, nil); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected DeadlineExceeded, got %v", err)
+	}
+
+	// Release the first PUT and confirm a fresh AppendContext now
+	// succeeds — proving the canceled call did not leak its
+	// reservation.
+	paths := store.observedPaths()
+	store.releasePut(paths[0])
+	if err := h1.Watcher.AwaitDurable(context.Background()); err != nil {
+		t.Fatalf("first watcher: %v", err)
+	}
+
+	h2, err := p.AppendContext(context.Background(), [][]byte{make([]byte, 16)}, nil)
+	if err != nil {
+		t.Fatalf("post-release AppendContext: %v", err)
+	}
+	if !store.waitForObserved(prefix, 2, 5*time.Second) {
+		t.Fatalf("second PUT never observed")
+	}
+	paths = store.observedPaths()
+	for _, p := range paths {
+		store.releasePut(p)
+	}
+	if err := h2.Watcher.AwaitDurable(context.Background()); err != nil {
+		t.Fatalf("second watcher: %v", err)
 	}
 }
 
