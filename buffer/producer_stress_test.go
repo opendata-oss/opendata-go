@@ -594,6 +594,63 @@ func TestProducer_manifest_retry_exhaustion_halts_producer(t *testing.T) {
 	}
 }
 
+// TestProducer_Close_canceled_ctx_returns_quickly: F4 of Phase 3
+// rev-2 review. Without the fix, a stuck store.Put call would
+// indefinitely block Close because the pipeline used
+// context.Background() everywhere; the unconditional `<-doneCh`
+// waits in Close had no escape hatch.
+//
+// Setup: choreographable store with a never-released PUT. Append one
+// batch (its uploader parks at the gate). Call Close with a ~150 ms
+// deadline. Assert: (a) Close returns ctx.Err() within ~250 ms;
+// (b) the in-flight watcher resolves with an error within the same
+// bound (the cancellation cascades through the pipeline because
+// shutdownCtx is wired into store.Put).
+func TestProducer_Close_canceled_ctx_returns_quickly(t *testing.T) {
+	store := newChoreographableStore()
+
+	cfg := testConfig()
+	cfg.FlushSizeBytes = 1
+	p := NewProducer(store, cfg)
+
+	h, err := p.Append([][]byte{[]byte("entry")}, nil)
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	prefix := cfg.DataPathPrefix + "/" + p.runID + "/"
+	if !store.waitForObserved(prefix, 1, 5*time.Second) {
+		t.Fatalf("PUT never observed at gate")
+	}
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	closeStart := time.Now()
+	closeErr := p.Close(closeCtx)
+	closeElapsed := time.Since(closeStart)
+
+	if closeElapsed > 500*time.Millisecond {
+		t.Fatalf("Close did not honor ctx deadline; took %v (expected ≤ 500 ms)", closeElapsed)
+	}
+	if closeErr == nil {
+		t.Fatalf("expected Close to return ctx.Err(); got nil")
+	}
+	if !errors.Is(closeErr, context.DeadlineExceeded) && !errors.Is(closeErr, context.Canceled) {
+		t.Fatalf("expected ctx error, got %v", closeErr)
+	}
+
+	// The in-flight watcher must resolve within a bounded window —
+	// the shutdown cascade aborts the store.Put via shutdownCtx and
+	// the resolver propagates the error. AwaitDurable's own ctx is
+	// generous so we observe the resolver-driven resolution rather
+	// than ctx-cancel.
+	awaitCtx, awaitCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer awaitCancel()
+	werr := h.Watcher.AwaitDurable(awaitCtx)
+	if werr == nil {
+		t.Fatalf("watcher resolved with nil after Close-ctx-cancel; expected an error")
+	}
+}
+
 // TestProducer_byte_budget_blocks_AppendContext_until_release exercises
 // F1 of the Phase 3 rev-2 review: `MaxInFlightBytes` must actually
 // gate `AppendContext`, not just sit in `ProducerConfig`. The first

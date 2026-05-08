@@ -249,6 +249,15 @@ type Producer struct {
 	// on capacity that won't return. F1 of Phase 3 rev-2 review.
 	shutdownCh chan struct{}
 
+	// shutdownCtx is the parent context for all internal store calls
+	// (uploader Put + manifest Get/PutIfMatch). cancelShutdown is
+	// called by Close when the caller-supplied ctx fires; it aborts
+	// every in-flight store call so the pipeline can drain quickly
+	// instead of blocking on context.Background()-rooted I/O.
+	// F4 of Phase 3 rev-2 review.
+	shutdownCtx    context.Context
+	cancelShutdown context.CancelFunc
+
 	// budget enforces MaxInFlightBytes and MaxInFlightBatches per
 	// design §Backpressure. Reservations are made in AppendContext
 	// (bytes) and the rotator emit (batch slot); both released by
@@ -352,6 +361,7 @@ func NewProducer(store objstore.ObjectStore, config ProducerConfig) *Producer {
 		shutdownCh:         make(chan struct{}),
 		budget:             newProducerBudget(config.MaxInFlightBytes, config.MaxInFlightBatches),
 	}
+	p.shutdownCtx, p.cancelShutdown = context.WithCancel(context.Background())
 	go p.rotator()
 	go p.encoderPool()
 	go p.uploaderPool()
@@ -646,8 +656,7 @@ func (p *Producer) uploaderWorker() {
 		if p.config.Observer != nil {
 			p.config.Observer.OnWorkersBusy(StageUpload, int(busy))
 		}
-		ctx := context.Background()
-		err := p.putWithRetry(ctx, eb)
+		err := p.putWithRetry(p.shutdownCtx, eb)
 		busy = p.uploadWorkersBusy.Add(-1)
 		if p.config.Observer != nil {
 			p.config.Observer.OnWorkersBusy(StageUpload, int(busy))
@@ -814,14 +823,13 @@ func (p *Producer) manifestCommitter() {
 	// the cumulative conflict count + the final error. F2 of
 	// Phase 3 rev-2 review.
 	casWithRetry := func(items []enqueueItem) (int, error) {
-		ctx := context.Background()
 		var (
 			totalConflicts int
 			err            error
 		)
 		for attempt := 0; attempt < manifestMaxAttempts; attempt++ {
 			var c int
-			c, err = p.enqueuer.enqueueBatch(ctx, items)
+			c, err = p.enqueuer.enqueueBatch(p.shutdownCtx, items)
 			totalConflicts += c
 			if err == nil {
 				return totalConflicts, nil
@@ -1137,16 +1145,55 @@ func (p *Producer) ConflictRate() float64 {
 }
 
 // Close flushes any remaining buffered entries and shuts down the producer.
+//
+// Honors `ctx` end-to-end: if it fires while waiting for any pipeline
+// goroutine to drain, Close cancels the shared shutdown context (which
+// aborts all in-flight store calls), closes the shutdown signal (which
+// unblocks any internal budget/retry waits), and returns `ctx.Err()`.
+// In-flight watchers resolve with the cancellation error as the
+// pipeline cascade propagates it. Without this, a stuck store call
+// would hang Close forever — F4 of Phase 3 rev-2 review.
 func (p *Producer) Close(ctx context.Context) error {
 	var err error
 	p.closeOnce.Do(func() {
-		err = p.Flush(ctx)
+		// Best-effort graceful flush. If ctx is already canceled or
+		// fires here, Flush returns the ctx error; we still proceed
+		// to the shutdown path (which will use the same ctx).
+		flushErr := p.Flush(ctx)
+
 		close(p.appendCh)
-		<-p.rotatorDone
-		<-p.encoderPoolDone
-		<-p.uploaderPoolDone
-		<-p.committerDone
-		<-p.resolverDone
+
+		// Wait for every pipeline goroutine to exit, with ctx as the
+		// ceiling. The waits are sequenced in dependency order — by
+		// the time a downstream channel's owner exits, the upstream
+		// stages have already drained.
+		dones := []<-chan struct{}{
+			p.rotatorDone,
+			p.encoderPoolDone,
+			p.uploaderPoolDone,
+			p.committerDone,
+			p.resolverDone,
+		}
+		for _, dc := range dones {
+			select {
+			case <-dc:
+			case <-ctx.Done():
+				// Force-abort: cancel all store calls and close the
+				// shutdown signal so internal budget/retry waits
+				// drop their channel selects. Goroutines exit in the
+				// background; we return ctx.Err() so the caller
+				// isn't blocked.
+				p.cancelShutdown()
+				select {
+				case <-p.shutdownCh:
+				default:
+					close(p.shutdownCh)
+				}
+				err = ctx.Err()
+				return
+			}
+		}
+		err = flushErr
 	})
 	return err
 }
