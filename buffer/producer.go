@@ -202,11 +202,20 @@ type Producer struct {
 	// until the Committer picks up. Phase 3.5 (Migration Plan step
 	// 6).
 	uploadCompletionCh chan *uploadCompletion
+	// resolverCh carries final per-batch outcomes from the Encoder
+	// (encode failures) and ManifestCommitter (commit success / PUT
+	// failure / CAS failure) to the WatcherResolver. The resolver
+	// calls OnFlush, resolves watchers, and signals flushAck —
+	// freeing the committer to move on to the next CAS without
+	// waiting for AwaitDurable consumers. Phase 3.6 (Migration Plan
+	// step 7).
+	resolverCh chan *resolverItem
 
 	rotatorDone     chan struct{}
 	encoderPoolDone chan struct{}
 	uploaderDone    chan struct{}
 	committerDone   chan struct{}
+	resolverDone    chan struct{}
 	closeOnce       sync.Once
 }
 
@@ -218,6 +227,23 @@ type Producer struct {
 type uploadCompletion struct {
 	eb       *encodedBatch
 	putError error // non-nil if the PUT failed; the committer skips the ordinal but resolves watchers
+}
+
+// resolverItem is what an upstream stage (Encoder on encode failure,
+// or ManifestCommitter on commit success / commit failure / PUT
+// failure) sends to the WatcherResolver. The resolver calls
+// OnFlush, resolves all watchers with `err`, and signals flushAck.
+//
+// Phase 3.6 (Migration Plan step 7) splits this out of the
+// ManifestCommitter so the committer can move on to the next CAS
+// without waiting for AwaitDurable consumers to drain.
+type resolverItem struct {
+	reason            FlushReason
+	stats             FlushStats
+	pipelineStartedAt time.Time
+	watchers          []*DurabilityWatcher
+	flushAck          chan error
+	err               error
 }
 
 // NewProducer creates a new Producer backed by the given ObjectStore.
@@ -239,15 +265,27 @@ func NewProducer(store objstore.ObjectStore, config ProducerConfig) *Producer {
 		pendingCh:          make(chan *pendingBatch),
 		encodedCh:          make(chan *encodedBatch),
 		uploadCompletionCh: make(chan *uploadCompletion),
+		resolverCh:         make(chan *resolverItem),
 		rotatorDone:        make(chan struct{}),
 		encoderPoolDone:    make(chan struct{}),
 		uploaderDone:       make(chan struct{}),
 		committerDone:      make(chan struct{}),
+		resolverDone:       make(chan struct{}),
 	}
 	go p.rotator()
 	go p.encoderPool()
 	go p.uploader()
 	go p.manifestCommitter()
+	go p.watcherResolver()
+	// Supervisor goroutine: closes resolverCh once all upstream
+	// senders (encoder pool + manifest committer) have exited. This
+	// is the standard pattern for closing a fan-in channel with
+	// multiple producers.
+	go func() {
+		<-p.encoderPoolDone
+		<-p.committerDone
+		close(p.resolverCh)
+	}()
 	return p
 }
 
@@ -408,14 +446,17 @@ func (p *Producer) encoder() {
 		pipelineStartedAt := time.Now()
 		payload, err := EncodeBatch(pb.entries, p.config.BatchCompression)
 		if err != nil {
-			if p.config.Observer != nil {
-				p.config.Observer.OnFlush(pb.reason, pb.stats, time.Since(pipelineStartedAt), err)
-			}
-			for _, dw := range pb.watchers {
-				dw.resolve(err)
-			}
-			if pb.flushAck != nil {
-				pb.flushAck <- err
+			// Encode failure: hand off to the WatcherResolver
+			// (Phase 3.6) instead of resolving inline. The
+			// resolver calls OnFlush, resolves watchers, and
+			// signals flushAck.
+			p.resolverCh <- &resolverItem{
+				reason:            pb.reason,
+				stats:             pb.stats,
+				pipelineStartedAt: pipelineStartedAt,
+				watchers:          pb.watchers,
+				flushAck:          pb.flushAck,
+				err:               err,
 			}
 			continue
 		}
@@ -513,20 +554,18 @@ func (p *Producer) manifestCommitter() {
 		batchSize = 1
 	}
 
+	// resolve hands off the batch's outcome to the WatcherResolver
+	// (Phase 3.6 — design §3.S5) so the committer can return to its
+	// loop and start the next CAS without waiting for AwaitDurable
+	// consumers.
 	resolve := func(uc *uploadCompletion, err error) {
-		if p.config.Observer != nil {
-			p.config.Observer.OnFlush(
-				uc.eb.reason,
-				uc.eb.stats,
-				time.Since(uc.eb.pipelineStartedAt),
-				err,
-			)
-		}
-		for _, dw := range uc.eb.watchers {
-			dw.resolve(err)
-		}
-		if uc.eb.flushAck != nil {
-			uc.eb.flushAck <- err
+		p.resolverCh <- &resolverItem{
+			reason:            uc.eb.reason,
+			stats:             uc.eb.stats,
+			pipelineStartedAt: uc.eb.pipelineStartedAt,
+			watchers:          uc.eb.watchers,
+			flushAck:          uc.eb.flushAck,
+			err:               err,
 		}
 	}
 
@@ -605,6 +644,30 @@ func (p *Producer) manifestCommitter() {
 	drain()
 }
 
+// watcherResolver consumes resolverItem values from resolverCh and
+// performs the per-batch terminal work — OnFlush observer call,
+// resolving every watcher with the batch's outcome, and (for
+// Flush-triggered batches) signaling flushAck. See design §3.S5.
+//
+// Single goroutine. Splitting this out of the ManifestCommitter
+// (Phase 3.5) frees the committer to start its next CAS as soon as
+// the previous CAS returns, without waiting for AwaitDurable
+// consumers to drain.
+func (p *Producer) watcherResolver() {
+	defer close(p.resolverDone)
+	for ri := range p.resolverCh {
+		if p.config.Observer != nil {
+			p.config.Observer.OnFlush(ri.reason, ri.stats, time.Since(ri.pipelineStartedAt), ri.err)
+		}
+		for _, dw := range ri.watchers {
+			dw.resolve(ri.err)
+		}
+		if ri.flushAck != nil {
+			ri.flushAck <- ri.err
+		}
+	}
+}
+
 // Append submits entries and associated metadata for buffering.
 // It returns a WriteHandle whose Watcher can be used to await durability.
 // Applies backpressure when the internal buffer is full.
@@ -648,10 +711,10 @@ func (p *Producer) Flush(ctx context.Context) error {
 	select {
 	case err := <-fm.result:
 		return err
-	case <-p.committerDone:
-		// Pipeline torn down before the manifest commit — the
-		// flushed batch's watchers were never resolved with a real
-		// outcome.
+	case <-p.resolverDone:
+		// Pipeline torn down before the resolver delivered the
+		// outcome — the flushed batch's watchers were never resolved
+		// with a real result.
 		return ErrShutdown
 	case <-ctx.Done():
 		return ctx.Err()
@@ -673,6 +736,7 @@ func (p *Producer) Close(ctx context.Context) error {
 		<-p.encoderPoolDone
 		<-p.uploaderDone
 		<-p.committerDone
+		<-p.resolverDone
 	})
 	return err
 }
