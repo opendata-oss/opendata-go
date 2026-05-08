@@ -42,17 +42,17 @@ type exporterTelemetry struct {
 	// rev-2 review. Names mirror design §Metrics with the
 	// `opendataexporter.` namespace prefix to keep them adjacent
 	// to the rest of the exporter's metrics in dashboards.
-	appendChBlockDuration       metric.Float64Histogram
-	workersBusyGauge            metric.Int64Gauge
-	encodeDuration              metric.Float64Histogram
-	uploadDuration              metric.Float64Histogram
-	manifestAppendBatchSize     metric.Int64Histogram
-	manifestAppendDuration      metric.Float64Histogram
-	headOfLineBlockDuration     metric.Float64Histogram
-	batchOutcomeTotal           metric.Int64Counter
-	haltedGauge                 metric.Int64Gauge
-	inflightBytesGauge          metric.Int64Gauge
-	inflightBatchesGauge        metric.Int64Gauge
+	appendChBlockDuration   metric.Float64Histogram
+	workersBusyGauge        metric.Int64Gauge
+	encodeDuration          metric.Float64Histogram
+	uploadDuration          metric.Float64Histogram
+	manifestAppendBatchSize metric.Int64Histogram
+	manifestAppendDuration  metric.Float64Histogram
+	headOfLineBlockDuration metric.Float64Histogram
+	batchOutcomeTotal       metric.Int64Counter
+	haltedGauge             metric.Int64Gauge
+	inflightBytesGauge      metric.Int64Gauge
+	inflightBatchesGauge    metric.Int64Gauge
 
 	slowRequestThreshold time.Duration
 	slowFlushThreshold   time.Duration

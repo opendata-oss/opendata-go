@@ -2,16 +2,16 @@
 //
 // One binary, two modes selected by --mode:
 //
-//   --mode exporter   (Phase 1.1):
-//       Drives Producer.Append + WriteHandle.Watcher.AwaitDurable in
-//       the path an OTel exporter would use. Stages: marshal,
-//       enqueue, await_durable.
+//	--mode exporter   (Phase 1.1):
+//	    Drives Producer.Append + WriteHandle.Watcher.AwaitDurable in
+//	    the path an OTel exporter would use. Stages: marshal,
+//	    enqueue, await_durable.
 //
-//   --mode producer   (Phase 1.2):
-//       Drives EncodeBatch + objstore.Put + manifest append (via
-//       Producer.Append/Flush) and decomposes per stage. Stages:
-//       encode, compress (no-op when compression=none), object_put,
-//       manifest_append.
+//	--mode producer   (Phase 1.2):
+//	    Drives EncodeBatch + objstore.Put + manifest append (via
+//	    Producer.Append/Flush) and decomposes per stage. Stages:
+//	    encode, compress (no-op when compression=none), object_put,
+//	    manifest_append.
 //
 // Both modes emit schema-v2 artifacts (metadata.json, results.json,
 // raw/run-N.metrics.jsonl) under --output-dir. See
@@ -39,20 +39,22 @@ import (
 )
 
 type args struct {
-	mode             string
-	recordsPerBatch  int
-	batches          int
-	recordBytes      int
-	iterations       int
-	seed             int64
-	outputDir        string
-	unitID           string
-	changeSlug       string
-	notes            string
+	mode                    string
+	recordsPerBatch         int
+	batches                 int
+	recordBytes             int
+	iterations              int
+	seed                    int64
+	outputDir               string
+	unitID                  string
+	changeSlug              string
+	notes                   string
 	flushSizeBytes          int
 	encodeConcurrency       int
 	uploadConcurrency       int
 	manifestAppendBatchSize int
+	variedParamName         string
+	variedParamValues       string
 }
 
 func parseArgs() args {
@@ -71,6 +73,8 @@ func parseArgs() args {
 	flag.IntVar(&a.encodeConcurrency, "encode-concurrency", 1, "EncodeConcurrency (Phase 3.4+)")
 	flag.IntVar(&a.uploadConcurrency, "upload-concurrency", 1, "UploadConcurrency (Phase 3.3+)")
 	flag.IntVar(&a.manifestAppendBatchSize, "manifest-append-batch-size", 1, "ManifestAppendBatchSize (Phase 3.5+)")
+	flag.StringVar(&a.variedParamName, "varied-param-name", "", "metadata.varied_param.name (e.g. ManifestAppendBatchSize) — required to populate varied_param")
+	flag.StringVar(&a.variedParamValues, "varied-param-values", "", "comma-separated values for metadata.varied_param.values (e.g. 1,16)")
 	flag.Parse()
 	if a.outputDir == "" {
 		fmt.Fprintln(os.Stderr, "--output-dir is required")
@@ -282,7 +286,7 @@ func runProducerIteration(ctx context.Context, iter int, a args) (*iterationResu
 		EncodeConcurrency:       a.encodeConcurrency,
 		UploadConcurrency:       a.uploadConcurrency,
 		ManifestAppendBatchSize: a.manifestAppendBatchSize,
-		BatchCompression:  buffer.CompressionNone,
+		BatchCompression:        buffer.CompressionNone,
 	}
 	p := buffer.NewProducer(full, cfg)
 
@@ -533,11 +537,11 @@ func main() {
 
 	// Stage aggregates across all iterations.
 	type stageOut struct {
-		Name           string  `json:"name"`
-		MedianMsPerOp  float64 `json:"median_ms_per_op"`
-		P10            float64 `json:"p10"`
-		P90            float64 `json:"p90"`
-		OpsPerSec      float64 `json:"ops_per_sec"`
+		Name          string  `json:"name"`
+		MedianMsPerOp float64 `json:"median_ms_per_op"`
+		P10           float64 `json:"p10"`
+		P90           float64 `json:"p90"`
+		OpsPerSec     float64 `json:"ops_per_sec"`
 	}
 	allStages := []stageOut{}
 	for _, name := range unit.stages {
@@ -575,19 +579,19 @@ func main() {
 		stagesPerIter := []map[string]any{}
 		for _, name := range unit.stages {
 			stagesPerIter = append(stagesPerIter, map[string]any{
-				"name":              name,
-				"median_ms_per_op":  median(r.StageObservations[name]) * 1000,
-				"p10":               percentile(r.StageObservations[name], 0.1) * 1000,
-				"p90":               percentile(r.StageObservations[name], 0.9) * 1000,
+				"name":             name,
+				"median_ms_per_op": median(r.StageObservations[name]) * 1000,
+				"p10":              percentile(r.StageObservations[name], 0.1) * 1000,
+				"p90":              percentile(r.StageObservations[name], 0.9) * 1000,
 			})
 		}
 		perIter = append(perIter, map[string]any{
 			"iteration": r.Iteration,
 			"scalars": map[string]any{
-				"iteration_elapsed_seconds":              r.ElapsedSeconds,
-				"iteration_throughput_records_per_sec":   thrRecsPerSec[idx],
-				"iteration_throughput_bytes_per_sec":     thrBytesPerSec[idx],
-				"iteration_records_processed":            float64(r.RecordsProcessed),
+				"iteration_elapsed_seconds":            r.ElapsedSeconds,
+				"iteration_throughput_records_per_sec": thrRecsPerSec[idx],
+				"iteration_throughput_bytes_per_sec":   thrBytesPerSec[idx],
+				"iteration_records_processed":          float64(r.RecordsProcessed),
 			},
 			"stages":      stagesPerIter,
 			"histograms":  map[string]any{},
@@ -666,7 +670,7 @@ func main() {
 			},
 			"matrix_file": nil,
 		},
-		"varied_param": nil,
+		"varied_param": variedParamObject(a),
 		"git":          gitMap,
 		"host":         host,
 		"binary": map[string]any{
@@ -676,14 +680,17 @@ func main() {
 			"build_flags":   "GOAMD64=v3 (recommend); default goarch otherwise",
 		},
 		"config": map[string]any{
-			"runtime_yaml_path":    nil,
-			"effective_yaml_hash":  "n/a",
+			"runtime_yaml_path":   nil,
+			"effective_yaml_hash": "n/a",
 			"effective_yaml": map[string]any{
-				"object_store":      "InMemory",
-				"flush_size_bytes":  a.flushSizeBytes,
-				"flush_interval_ms": 50,
-				"max_buffered_inputs": 1024,
-				"batch_compression": "none",
+				"object_store":               "InMemory",
+				"flush_size_bytes":           a.flushSizeBytes,
+				"flush_interval_ms":          50,
+				"max_buffered_inputs":        1024,
+				"batch_compression":          "none",
+				"encode_concurrency":         a.encodeConcurrency,
+				"upload_concurrency":         a.uploadConcurrency,
+				"manifest_append_batch_size": a.manifestAppendBatchSize,
 			},
 		},
 		"services": map[string]any{
@@ -692,21 +699,21 @@ func main() {
 			"iceberg":      nil,
 		},
 		"workload": map[string]any{
-			"generator":            "opendata-go cmd/bench",
-			"generator_rev":        "see git.opendata-go.rev",
-			"seed":                 a.seed,
-			"schema":               "buffer-bytes-v1",
-			"schema_hash":          "sha256:" + sha256Hex([]byte("buffer-bytes-v1")),
-			"fingerprint":          fingerprint,
-			"fingerprint_hash":     "sha256:" + sha256Hex(canonical),
-			"canonical_path":       "raw/workload.canonical.json",
-			"records_total":        a.recordsPerBatch * a.batches,
-			"batches_total":        a.batches,
-			"records_per_batch":    a.recordsPerBatch,
+			"generator":               "opendata-go cmd/bench",
+			"generator_rev":           "see git.opendata-go.rev",
+			"seed":                    a.seed,
+			"schema":                  "buffer-bytes-v1",
+			"schema_hash":             "sha256:" + sha256Hex([]byte("buffer-bytes-v1")),
+			"fingerprint":             fingerprint,
+			"fingerprint_hash":        "sha256:" + sha256Hex(canonical),
+			"canonical_path":          "raw/workload.canonical.json",
+			"records_total":           a.recordsPerBatch * a.batches,
+			"batches_total":           a.batches,
+			"records_per_batch":       a.recordsPerBatch,
 			"approx_bytes_per_record": a.recordBytes,
-			"encoding":             "raw-bytes",
-			"compression":          "none",
-			"attribute_cardinality": nil,
+			"encoding":                "raw-bytes",
+			"compression":             "none",
+			"attribute_cardinality":   nil,
 		},
 		"iterations":   a.iterations,
 		"baseline_run": nil,
@@ -717,6 +724,33 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("Wrote artifacts to %s\n", runDir)
+}
+
+// variedParamObject constructs the metadata.varied_param block from
+// the --varied-param-name and --varied-param-values flags. Returns
+// nil when either flag is empty (the bench was a non-A/B run with
+// no swept parameter).
+//
+// Format matches the schema-v2 contract from
+// plans/odb-high-throughput/benchmarks.md: a structured object with
+// `name` and `values` so downstream tooling can group / pivot
+// without parsing free-text notes.
+func variedParamObject(a args) any {
+	if a.variedParamName == "" || a.variedParamValues == "" {
+		return nil
+	}
+	values := []any{}
+	for _, v := range strings.Split(a.variedParamValues, ",") {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		values = append(values, v)
+	}
+	return map[string]any{
+		"name":   a.variedParamName,
+		"values": values,
+	}
 }
 
 func max(a, b float64) float64 {

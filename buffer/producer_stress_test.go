@@ -519,20 +519,20 @@ type haltObserver struct {
 	lastHalted  bool
 }
 
-func (o *haltObserver) OnAccepted()                                                     {}
-func (o *haltObserver) OnFlush(FlushReason, FlushStats, time.Duration, error)           {}
-func (o *haltObserver) OnStorePut(int, time.Duration, error)                            {}
-func (o *haltObserver) OnManifestEnqueue(int, time.Duration, int, error)                {}
-func (o *haltObserver) OnAppendChBlock(time.Duration)                                   {}
-func (o *haltObserver) OnWorkersBusy(PipelineStage, int)                                {}
-func (o *haltObserver) OnEncodeDuration(time.Duration, error)                           {}
-func (o *haltObserver) OnUploadDuration(time.Duration, int, error)                      {}
-func (o *haltObserver) OnManifestAppendBatchSize(int)                                   {}
-func (o *haltObserver) OnManifestAppendDuration(time.Duration, int, error)              {}
-func (o *haltObserver) OnHeadOfLineBlock(time.Duration)                                 {}
-func (o *haltObserver) OnBatchOutcome(BatchOutcome)                                     {}
-func (o *haltObserver) OnInflightBytes(int64)                                           {}
-func (o *haltObserver) OnInflightBatches(int)                                           {}
+func (o *haltObserver) OnAccepted()                                           {}
+func (o *haltObserver) OnFlush(FlushReason, FlushStats, time.Duration, error) {}
+func (o *haltObserver) OnStorePut(int, time.Duration, error)                  {}
+func (o *haltObserver) OnManifestEnqueue(int, time.Duration, int, error)      {}
+func (o *haltObserver) OnAppendChBlock(time.Duration)                         {}
+func (o *haltObserver) OnWorkersBusy(PipelineStage, int)                      {}
+func (o *haltObserver) OnEncodeDuration(time.Duration, error)                 {}
+func (o *haltObserver) OnUploadDuration(time.Duration, int, error)            {}
+func (o *haltObserver) OnManifestAppendBatchSize(int)                         {}
+func (o *haltObserver) OnManifestAppendDuration(time.Duration, int, error)    {}
+func (o *haltObserver) OnHeadOfLineBlock(time.Duration)                       {}
+func (o *haltObserver) OnBatchOutcome(BatchOutcome)                           {}
+func (o *haltObserver) OnInflightBytes(int64)                                 {}
+func (o *haltObserver) OnInflightBatches(int)                                 {}
 func (o *haltObserver) OnHalted(halted bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()

@@ -273,8 +273,8 @@ type Producer struct {
 	// AppendContext returns ErrProducerHalted immediately and the
 	// committer resolves every subsequent batch with the same error
 	// without attempting a CAS. F2 of Phase 3 rev-2 review.
-	halted        atomic.Bool
-	haltedNotify  sync.Once // guards a one-time OnHalted(true) emit
+	halted       atomic.Bool
+	haltedNotify sync.Once // guards a one-time OnHalted(true) emit
 }
 
 // uploadCompletion is what the Uploader signals to the
