@@ -379,6 +379,221 @@ func TestProducer_uploads_complete_out_of_order(t *testing.T) {
 	}
 }
 
+// faultyStore wraps an InMemory ObjectStore and injects per-method
+// failures by counter. Tests configure failPutCount / failCASCount
+// (atomic) — the next N calls to Put / PutIfMatch return the
+// configured failure error before the call falls through to the inner
+// store. Used by the F2 retry / halt tests.
+type faultyStore struct {
+	inner *objstore.InMemory
+
+	// Atomic counters: each call decrements; while > 0, the call
+	// returns failPutErr / failCASErr.
+	failPutCount atomic.Int64
+	failCASErr   error
+	failCASCount atomic.Int64
+	failPutErr   error
+
+	putCalls atomic.Int64
+	casCalls atomic.Int64
+}
+
+func newFaultyStore() *faultyStore {
+	return &faultyStore{inner: objstore.NewInMemory()}
+}
+
+func (s *faultyStore) Get(ctx context.Context, path string) (objstore.GetResult, error) {
+	return s.inner.Get(ctx, path)
+}
+
+func (s *faultyStore) Put(ctx context.Context, path string, data []byte) error {
+	s.putCalls.Add(1)
+	if s.failPutCount.Load() > 0 {
+		s.failPutCount.Add(-1)
+		return s.failPutErr
+	}
+	return s.inner.Put(ctx, path, data)
+}
+
+func (s *faultyStore) PutIfMatch(ctx context.Context, path string, data []byte, version *objstore.Version) error {
+	s.casCalls.Add(1)
+	if s.failCASCount.Load() > 0 {
+		s.failCASCount.Add(-1)
+		return s.failCASErr
+	}
+	return s.inner.PutIfMatch(ctx, path, data, version)
+}
+
+func (s *faultyStore) Delete(ctx context.Context, path string) error {
+	return s.inner.Delete(ctx, path)
+}
+
+// TestProducer_upload_retries_succeed_within_budget: F2 of Phase 3
+// rev-2 review. UploadMaxAttempts=3; the store fails the first 2
+// PUT calls; the 3rd succeeds. Watcher resolves with nil and the
+// store observed exactly 3 PUTs.
+func TestProducer_upload_retries_succeed_within_budget(t *testing.T) {
+	store := newFaultyStore()
+	store.failPutErr = errors.New("transient PUT error")
+	store.failPutCount.Store(2)
+
+	cfg := testConfig()
+	cfg.FlushSizeBytes = 1
+	cfg.UploadMaxAttempts = 3
+	cfg.UploadInitialBackoff = time.Millisecond
+	p := NewProducer(store, cfg)
+	defer func() { _ = p.Close(context.Background()) }()
+
+	h, err := p.Append([][]byte{[]byte("entry")}, nil)
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := h.Watcher.AwaitDurable(ctx); err != nil {
+		t.Fatalf("watcher: %v", err)
+	}
+	if got := store.putCalls.Load(); got != 3 {
+		t.Fatalf("expected exactly 3 PUT attempts, got %d", got)
+	}
+}
+
+// TestProducer_upload_retry_exhaustion_resolves_with_error: store
+// always fails PUT; UploadMaxAttempts=2; watcher resolves with
+// the underlying storage error and the committer skips the
+// ordinal. Producer is NOT halted — design §Failure → Upload
+// failure: "permanent. Resolve watchers with error; committer
+// skips the ordinal."
+func TestProducer_upload_retry_exhaustion_resolves_with_error(t *testing.T) {
+	store := newFaultyStore()
+	store.failPutErr = errors.New("permanent PUT error")
+	store.failPutCount.Store(100) // way more than UploadMaxAttempts
+
+	cfg := testConfig()
+	cfg.FlushSizeBytes = 1
+	cfg.UploadMaxAttempts = 2
+	cfg.UploadInitialBackoff = time.Millisecond
+	p := NewProducer(store, cfg)
+	defer func() { _ = p.Close(context.Background()) }()
+
+	h, err := p.Append([][]byte{[]byte("entry")}, nil)
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	werr := h.Watcher.AwaitDurable(ctx)
+	if werr == nil {
+		t.Fatalf("watcher resolved with nil; expected the underlying PUT error")
+	}
+	if !errors.Is(werr, ErrStorage) {
+		t.Fatalf("expected ErrStorage in chain; got %v", werr)
+	}
+	// Producer must NOT be halted — upload exhaustion is a per-batch
+	// permanent failure, not a producer-wide one.
+	if p.halted.Load() {
+		t.Fatalf("producer halted after upload retry exhaustion; design says only manifest exhaustion halts")
+	}
+	// Subsequent Append must succeed (and would itself fail upload
+	// because the store is still failing — but that's the next
+	// batch's problem; the producer accepts new work).
+	h2, err := p.Append([][]byte{[]byte("e2")}, nil)
+	if err != nil {
+		t.Fatalf("post-failure Append: %v", err)
+	}
+	werr = h2.Watcher.AwaitDurable(ctx)
+	if werr == nil || !errors.Is(werr, ErrStorage) {
+		t.Fatalf("second watcher: expected ErrStorage, got %v", werr)
+	}
+	if got := store.putCalls.Load(); got != 4 {
+		t.Fatalf("expected 4 PUT attempts (2 per batch × 2 batches), got %d", got)
+	}
+}
+
+// haltObserver counts OnHalted invocations and records the last
+// halted state. Used to assert that a halted producer notifies its
+// observer exactly once.
+type haltObserver struct {
+	mu          sync.Mutex
+	haltedCalls int
+	lastHalted  bool
+}
+
+func (o *haltObserver) OnAccepted()                                                     {}
+func (o *haltObserver) OnFlush(FlushReason, FlushStats, time.Duration, error)           {}
+func (o *haltObserver) OnStorePut(int, time.Duration, error)                            {}
+func (o *haltObserver) OnManifestEnqueue(int, time.Duration, int, error)                {}
+func (o *haltObserver) OnAppendChBlock(time.Duration)                                   {}
+func (o *haltObserver) OnWorkersBusy(PipelineStage, int)                                {}
+func (o *haltObserver) OnEncodeDuration(time.Duration, error)                           {}
+func (o *haltObserver) OnUploadDuration(time.Duration, int, error)                      {}
+func (o *haltObserver) OnManifestAppendBatchSize(int)                                   {}
+func (o *haltObserver) OnManifestAppendDuration(time.Duration, int, error)              {}
+func (o *haltObserver) OnHeadOfLineBlock(time.Duration)                                 {}
+func (o *haltObserver) OnBatchOutcome(BatchOutcome)                                     {}
+func (o *haltObserver) OnInflightBytes(int64)                                           {}
+func (o *haltObserver) OnInflightBatches(int)                                           {}
+func (o *haltObserver) OnHalted(halted bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.haltedCalls++
+	o.lastHalted = halted
+}
+
+// TestProducer_manifest_retry_exhaustion_halts_producer: F2 of
+// Phase 3 rev-2 review. Store always fails PutIfMatch (with a
+// non-CAS-conflict error); ManifestMaxAttempts=2; the producer must:
+//
+//  1. resolve the in-flight batch's watcher with ErrProducerHalted
+//  2. transition to halted state (Producer.halted == true)
+//  3. emit OnHalted(true) exactly once
+//  4. reject subsequent Append calls with ErrProducerHalted
+func TestProducer_manifest_retry_exhaustion_halts_producer(t *testing.T) {
+	store := newFaultyStore()
+	store.failCASErr = errors.New("permanent CAS error")
+	store.failCASCount.Store(100)
+
+	obs := &haltObserver{}
+
+	cfg := testConfig()
+	cfg.FlushSizeBytes = 1
+	cfg.ManifestMaxAttempts = 2
+	cfg.ManifestInitialBackoff = time.Millisecond
+	cfg.Observer = obs
+	p := NewProducer(store, cfg)
+	defer func() { _ = p.Close(context.Background()) }()
+
+	h, err := p.Append([][]byte{[]byte("entry")}, nil)
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	werr := h.Watcher.AwaitDurable(ctx)
+	if !errors.Is(werr, ErrProducerHalted) {
+		t.Fatalf("expected ErrProducerHalted, got %v", werr)
+	}
+	if !p.halted.Load() {
+		t.Fatalf("producer.halted not set after manifest retry exhaustion")
+	}
+	obs.mu.Lock()
+	if obs.haltedCalls != 1 || !obs.lastHalted {
+		t.Fatalf("expected exactly one OnHalted(true); got %d calls (lastHalted=%v)", obs.haltedCalls, obs.lastHalted)
+	}
+	obs.mu.Unlock()
+
+	// Subsequent Append must return ErrProducerHalted immediately.
+	if _, err := p.Append([][]byte{[]byte("e2")}, nil); !errors.Is(err, ErrProducerHalted) {
+		t.Fatalf("expected ErrProducerHalted, got %v", err)
+	}
+	// And the manifest must record exactly ManifestMaxAttempts CAS
+	// calls (we don't count internal ErrPreconditionFailed retries
+	// because the fault store's failure isn't precondition-failed).
+	if got := store.casCalls.Load(); got != 2 {
+		t.Fatalf("expected exactly 2 CAS attempts (= ManifestMaxAttempts), got %d", got)
+	}
+}
+
 // TestProducer_byte_budget_blocks_AppendContext_until_release exercises
 // F1 of the Phase 3 rev-2 review: `MaxInFlightBytes` must actually
 // gate `AppendContext`, not just sit in `ProducerConfig`. The first

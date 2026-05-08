@@ -2,6 +2,7 @@ package buffer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -257,6 +258,14 @@ type Producer struct {
 	// Phase 3.7 metrics state (atomic counters for `workers_busy`).
 	encodeWorkersBusy atomic.Int64
 	uploadWorkersBusy atomic.Int64
+
+	// halted marks the producer as terminally failed (manifest CAS
+	// retry budget exhausted on a non-CAS-conflict error). Once set,
+	// AppendContext returns ErrProducerHalted immediately and the
+	// committer resolves every subsequent batch with the same error
+	// without attempting a CAS. F2 of Phase 3 rev-2 review.
+	halted        atomic.Bool
+	haltedNotify  sync.Once // guards a one-time OnHalted(true) emit
 }
 
 // uploadCompletion is what the Uploader signals to the
@@ -615,12 +624,22 @@ func (p *Producer) uploaderPool() {
 }
 
 // uploaderWorker is one worker in the uploader pool. Reads
-// encodedBatch values from encodedCh, runs the data-object PUT,
-// and signals the result to the ManifestCommitter via
-// uploadCompletionCh. PUT success and PUT failure both flow
-// through uploadCompletionCh — failures carry a non-nil putError
-// so the committer can skip the ordinal in the manifest sequence
-// and resolve the batch's watchers with the error.
+// encodedBatch values from encodedCh, runs the data-object PUT
+// (retried up to UploadMaxAttempts with exponential backoff per
+// design §Failure → Upload failure), and signals the result to the
+// ManifestCommitter via uploadCompletionCh. PUT success and PUT
+// failure both flow through uploadCompletionCh — failures carry a
+// non-nil putError so the committer can skip the ordinal in the
+// manifest sequence and resolve the batch's watchers with the
+// error.
+//
+// Retry strategy (F2 of Phase 3 rev-2 review): retry every error
+// uniformly until UploadMaxAttempts is hit. The design distinguishes
+// retryable (network/5xx/throttling) from non-retryable (4xx other
+// than 429), but the objstore package does not yet categorize
+// errors, so we retry uniformly. Non-retryable failures pay a
+// modest extra-attempts cost rather than fail fast — acceptable
+// because uploads are off the critical metadata path.
 func (p *Producer) uploaderWorker() {
 	for eb := range p.encodedCh {
 		busy := p.uploadWorkersBusy.Add(1)
@@ -628,23 +647,73 @@ func (p *Producer) uploaderWorker() {
 			p.config.Observer.OnWorkersBusy(StageUpload, int(busy))
 		}
 		ctx := context.Background()
-		putStart := time.Now()
-		err := p.store.Put(ctx, eb.location, eb.payload)
-		putDuration := time.Since(putStart)
+		err := p.putWithRetry(ctx, eb)
 		busy = p.uploadWorkersBusy.Add(-1)
 		if p.config.Observer != nil {
-			p.config.Observer.OnStorePut(eb.size, putDuration, err)
-			p.config.Observer.OnUploadDuration(putDuration, eb.size, err)
 			p.config.Observer.OnWorkersBusy(StageUpload, int(busy))
-		}
-		if err != nil {
-			err = storageErr(err.Error())
 		}
 		// Always signal the committer — even on PUT failure — so
 		// the committer can resolve the batch's watchers and skip
 		// the ordinal in the manifest sequence.
 		p.uploadCompletionCh <- &uploadCompletion{eb: eb, putError: err}
 	}
+}
+
+// putWithRetry attempts up to `UploadMaxAttempts` PUTs of the
+// encoded batch's payload, with exponential backoff starting at
+// `UploadInitialBackoff`. Per-attempt OnStorePut + OnUploadDuration
+// observer hooks fire on every attempt. Returns the last error wrapped
+// as a storage error, or nil on success. Aborts early on shutdownCh
+// fire, returning ErrShutdown.
+func (p *Producer) putWithRetry(ctx context.Context, eb *encodedBatch) error {
+	maxAttempts := p.config.UploadMaxAttempts
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	backoff := p.config.UploadInitialBackoff
+	if backoff <= 0 {
+		backoff = DefaultUploadInitialBackoff
+	}
+
+	var err error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		putStart := time.Now()
+		err = p.store.Put(ctx, eb.location, eb.payload)
+		putDuration := time.Since(putStart)
+		if p.config.Observer != nil {
+			p.config.Observer.OnStorePut(eb.size, putDuration, err)
+			p.config.Observer.OnUploadDuration(putDuration, eb.size, err)
+		}
+		if err == nil {
+			return nil
+		}
+		// Backoff before the next attempt, unless this was the last
+		// attempt — in which case fall through to return the error.
+		if attempt+1 < maxAttempts {
+			select {
+			case <-time.After(backoffFor(attempt, backoff)):
+			case <-p.shutdownCh:
+				return ErrShutdown
+			}
+		}
+	}
+	return storageErr(err.Error())
+}
+
+// backoffFor returns the exponential backoff duration for the given
+// attempt index (0 = first retry). Doubles per attempt, capped at
+// 10s. Pure function — same input gives same output, so tests can
+// assert timing bounds.
+func backoffFor(attempt int, initial time.Duration) time.Duration {
+	const maxBackoff = 10 * time.Second
+	d := initial
+	for i := 0; i < attempt && d < maxBackoff; i++ {
+		d *= 2
+	}
+	if d > maxBackoff {
+		d = maxBackoff
+	}
+	return d
 }
 
 // manifestCommitter drains upload completions in monotonic ordinal
@@ -687,6 +756,32 @@ func (p *Producer) manifestCommitter() {
 	if batchSize < 1 {
 		batchSize = 1
 	}
+	manifestMaxAttempts := p.config.ManifestMaxAttempts
+	if manifestMaxAttempts < 1 {
+		manifestMaxAttempts = 1
+	}
+	manifestBackoff := p.config.ManifestInitialBackoff
+	if manifestBackoff <= 0 {
+		manifestBackoff = DefaultManifestInitialBackoff
+	}
+
+	// halted is the local mirror of p.halted — once flipped, the
+	// committer abandons the manifest, resolves the current group +
+	// every batch in `ready` with ErrProducerHalted, and drains the
+	// remaining uploadCompletionCh stream with the same error so
+	// upstream goroutines don't get stuck. F2 of Phase 3 rev-2 review.
+	halted := false
+
+	enterHalted := func(reason error) {
+		halted = true
+		p.halted.Store(true)
+		p.haltedNotify.Do(func() {
+			if p.config.Observer != nil {
+				p.config.Observer.OnHalted(true)
+			}
+		})
+		_ = reason // kept as a parameter for future structured-error logging
+	}
 
 	// head-of-line block measurement: when the committer is waiting
 	// for the next-expected ordinal but later ordinals are already
@@ -711,6 +806,35 @@ func (p *Producer) manifestCommitter() {
 			outcome:           outcome,
 			byteCost:          uc.eb.byteCost,
 		}
+	}
+
+	// casWithRetry wraps enqueueBatch (which already retries
+	// internally on ErrPreconditionFailed) with an outer retry on
+	// other storage errors, bounded by ManifestMaxAttempts. Returns
+	// the cumulative conflict count + the final error. F2 of
+	// Phase 3 rev-2 review.
+	casWithRetry := func(items []enqueueItem) (int, error) {
+		ctx := context.Background()
+		var (
+			totalConflicts int
+			err            error
+		)
+		for attempt := 0; attempt < manifestMaxAttempts; attempt++ {
+			var c int
+			c, err = p.enqueuer.enqueueBatch(ctx, items)
+			totalConflicts += c
+			if err == nil {
+				return totalConflicts, nil
+			}
+			if attempt+1 < manifestMaxAttempts {
+				select {
+				case <-time.After(backoffFor(attempt, manifestBackoff)):
+				case <-p.shutdownCh:
+					return totalConflicts, ErrShutdown
+				}
+			}
+		}
+		return totalConflicts, err
 	}
 
 	drain := func() {
@@ -750,11 +874,10 @@ func (p *Producer) manifestCommitter() {
 						Metadata: uc.eb.metadata,
 					})
 				}
-				ctx := context.Background()
 				manifestStart := time.Now()
-				var conflicts int
-				conflicts, casErr = p.enqueuer.enqueueBatch(ctx, items)
+				conflicts, err := casWithRetry(items)
 				casDuration := time.Since(manifestStart)
+				casErr = err
 				if p.config.Observer != nil {
 					totalMeta := 0
 					for _, it := range items {
@@ -764,6 +887,28 @@ func (p *Producer) manifestCommitter() {
 					p.config.Observer.OnManifestAppendBatchSize(len(items))
 					p.config.Observer.OnManifestAppendDuration(casDuration, conflicts, casErr)
 				}
+			}
+
+			// On retry-exhausted CAS error (anything that isn't
+			// shutdown), enter halted state: resolve current group +
+			// failed-upload group + every remaining batch in `ready`
+			// with ErrProducerHalted. The committer keeps reading
+			// uploadCompletionCh after this so upstream uploaders
+			// can drain, but treats every subsequent receive as a
+			// halted resolution.
+			if casErr != nil && !errors.Is(casErr, ErrShutdown) {
+				enterHalted(casErr)
+				for _, uc := range group {
+					resolve(uc, ErrProducerHalted, OutcomeManifestFailed)
+				}
+				for _, pr := range failed {
+					resolve(pr.uc, pr.err, OutcomeUploadFailed)
+				}
+				for _, uc := range ready {
+					resolve(uc, ErrProducerHalted, OutcomeAbandoned)
+				}
+				ready = make(map[uint64]*uploadCompletion)
+				return
 			}
 
 			groupOutcome := OutcomeCommitted
@@ -808,8 +953,18 @@ func (p *Producer) manifestCommitter() {
 	for {
 		uc, ok := <-p.uploadCompletionCh
 		if !ok {
-			drain()
+			if !halted {
+				drain()
+			}
 			return
+		}
+		// Halted-mode short-circuit: resolve every incoming batch
+		// with ErrProducerHalted, no CAS attempted. Keeps the
+		// uploaderPool unblocked so the pipeline can drain to close
+		// even after a halt.
+		if halted {
+			resolve(uc, ErrProducerHalted, OutcomeAbandoned)
+			continue
 		}
 		ready[uc.eb.ordinal] = uc
 
@@ -911,6 +1066,13 @@ func (p *Producer) AppendContext(ctx context.Context, entries [][]byte, metadata
 	}
 	if metadata == nil {
 		metadata = []byte{}
+	}
+	// Halted-state short-circuit: once the manifest CAS retry budget
+	// has been exhausted, all subsequent Appends fail immediately
+	// per design §Failure → Manifest CAS failure. F2 of Phase 3 rev-2
+	// review.
+	if p.halted.Load() {
+		return nil, ErrProducerHalted
 	}
 
 	byteCost := appendByteCost(entries, metadata)
