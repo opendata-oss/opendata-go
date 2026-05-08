@@ -128,6 +128,33 @@ func (b *batchAccumulator) stats() FlushStats {
 	}
 }
 
+// readyBatch is the unit of work the Rotator emits to the Uploader.
+//
+// Phase 3.3 of the producer pipelining design (Migration Plan step 4)
+// introduces this two-stage layout: the Rotator owns the accumulator
+// and assigns monotonic ordinals; the Uploader consumes ready batches
+// and runs the existing encode + PUT + manifest CAS + watcher-resolve
+// sequence in one body. Subsequent units split that body further:
+// 3.4 splits the Encoder out (§3.S2), 3.5 splits the ManifestCommitter
+// out (§3.S4), 3.6 splits the WatcherResolver out (§3.S5).
+//
+// The location format change (`<run_id>/<ordinal:016x>` per §3.S2) is
+// deferred to 3.4 alongside the Encoder pool. The `ordinal` field is
+// already populated here so 3.4's diff is local to the Encoder.
+type readyBatch struct {
+	ordinal  uint64
+	entries  [][]byte
+	metadata []QueueMetadata
+	watchers []*DurabilityWatcher
+	stats    FlushStats
+	reason   FlushReason
+	// flushAck is non-nil only for batches emitted in response to a
+	// Producer.Flush call. The Uploader sends the per-batch result
+	// to this channel after the watchers are resolved, so Flush can
+	// return the durable outcome to its caller.
+	flushAck chan error
+}
+
 // Producer accepts opaque byte entries, batches them, and flushes to object
 // storage on size or time thresholds.
 type Producer struct {
@@ -135,31 +162,92 @@ type Producer struct {
 	store    objstore.ObjectStore
 	config   ProducerConfig
 
-	appendCh  chan *appendMessage
-	flushCh   chan *flushMessage
-	done      chan struct{}
-	closeOnce sync.Once
+	appendCh chan *appendMessage
+	flushCh  chan *flushMessage
+	// readyCh carries ready batches from the Rotator to the Uploader.
+	// Unbuffered: the Rotator blocks on send until the Uploader picks
+	// the batch up. With UploadConcurrency=1 (Phase 3.3 default) this
+	// preserves the pre-Phase-3 single-flight throughput exactly —
+	// while the Uploader is encoding/uploading, the Rotator stops
+	// emitting and (transitively) stops draining appendCh, so
+	// appendCh fills and Append callers block, identical to the
+	// pre-Phase-3 behavior.
+	readyCh chan *readyBatch
+
+	rotatorDone  chan struct{}
+	uploaderDone chan struct{}
+	closeOnce    sync.Once
 }
 
 // NewProducer creates a new Producer backed by the given ObjectStore.
+//
+// Spawns one Rotator goroutine + one Uploader goroutine. See
+// `plans/odb-high-throughput/phase03-producer-pipelining-design.md`
+// for the pipeline contract.
 func NewProducer(store objstore.ObjectStore, config ProducerConfig) *Producer {
 	enqueuer := newManifestEnqueuer(store, config.ManifestPath)
 	p := &Producer{
-		enqueuer: enqueuer,
-		store:    store,
-		config:   config,
-		appendCh: make(chan *appendMessage, config.MaxBufferedInputs),
-		flushCh:  make(chan *flushMessage),
-		done:     make(chan struct{}),
+		enqueuer:     enqueuer,
+		store:        store,
+		config:       config,
+		appendCh:     make(chan *appendMessage, config.MaxBufferedInputs),
+		flushCh:      make(chan *flushMessage),
+		readyCh:      make(chan *readyBatch),
+		rotatorDone:  make(chan struct{}),
+		uploaderDone: make(chan struct{}),
 	}
-	go p.run()
+	go p.rotator()
+	go p.uploader()
 	return p
 }
 
-func (p *Producer) run() {
-	defer close(p.done)
+// rotator drains appendCh, manages the open accumulator, assigns
+// monotonic ordinals at rotation time, and emits ready batches to
+// readyCh on size / time / manual-flush / shutdown triggers.
+//
+// Single goroutine: ordinals are strictly monotonic by construction
+// (no other goroutine increments the counter). See design §3.S1.
+//
+// Lifecycle: when appendCh closes, the rotator emits any open
+// accumulator as a final FlushReasonShutdown batch (or skips if
+// empty), closes readyCh (signaling the uploader to drain and
+// exit), and signals rotatorDone.
+func (p *Producer) rotator() {
+	defer close(p.rotatorDone)
+	defer close(p.readyCh)
 
 	batch := &batchAccumulator{}
+	var ordinal uint64
+
+	emit := func(reason FlushReason, flushAck chan error) {
+		if batch.isEmpty() {
+			// For a flush request against an empty accumulator,
+			// signal success immediately without sending to the
+			// uploader. Preserves the pre-Phase-3 behavior of
+			// `Flush` returning nil for an empty buffer.
+			if flushAck != nil {
+				flushAck <- nil
+			}
+			return
+		}
+		stats := batch.stats()
+		entries, metadata, watchers := batch.reset()
+		rb := &readyBatch{
+			ordinal:  ordinal,
+			entries:  entries,
+			metadata: metadata,
+			watchers: watchers,
+			stats:    stats,
+			reason:   reason,
+			flushAck: flushAck,
+		}
+		ordinal++
+		// Blocks until uploader takes it. While blocked, this
+		// goroutine isn't draining appendCh either, so backpressure
+		// propagates through appendCh to Append callers — exactly
+		// matching the pre-Phase-3 single-goroutine behavior.
+		p.readyCh <- rb
+	}
 
 	var timer *time.Timer
 	resetTimer := func() {
@@ -188,28 +276,35 @@ func (p *Producer) run() {
 		select {
 		case msg, ok := <-p.appendCh:
 			if !ok {
-				// Channel closed — flush remaining and exit.
-				_ = p.writeBatch(batch, FlushReasonShutdown)
+				// Channel closed — emit any remaining accumulator
+				// as a final shutdown batch, then exit. The deferred
+				// close(p.readyCh) signals the uploader to drain
+				// the channel (now empty after the emit) and exit.
+				emit(FlushReasonShutdown, nil)
 				return
 			}
 			batch.add(msg)
 			if batch.sizeBytes >= p.config.FlushSizeBytes {
-				_ = p.writeBatch(batch, FlushReasonSize)
+				emit(FlushReasonSize, nil)
 			}
 		case fm := <-p.flushCh:
-			// Drain any pending append messages before flushing.
-			p.drainAppendCh(batch)
-			fm.result <- p.writeBatch(batch, FlushReasonManual)
+			// Drain any pending append messages into the accumulator
+			// before emitting, so the flush captures everything
+			// submitted before this Flush call.
+			drainAppendChInto(p.appendCh, batch)
+			emit(FlushReasonManual, fm.result)
 		case <-timerCh:
-			_ = p.writeBatch(batch, FlushReasonTime)
+			emit(FlushReasonTime, nil)
 		}
 	}
 }
 
-func (p *Producer) drainAppendCh(batch *batchAccumulator) {
+// drainAppendChInto greedily moves any messages currently sitting in
+// the channel into the accumulator without blocking.
+func drainAppendChInto(appendCh chan *appendMessage, batch *batchAccumulator) {
 	for {
 		select {
-		case msg, ok := <-p.appendCh:
+		case msg, ok := <-appendCh:
 			if !ok {
 				return
 			}
@@ -220,22 +315,31 @@ func (p *Producer) drainAppendCh(batch *batchAccumulator) {
 	}
 }
 
-func (p *Producer) writeBatch(batch *batchAccumulator, reason FlushReason) error {
-	if batch.isEmpty() {
-		return nil
-	}
+// uploader consumes ready batches from readyCh and runs the existing
+// encode + PUT + manifest CAS + watcher-resolve sequence in one body.
+// Phase 3.4 (Encoder pool), 3.5 (ManifestCommitter), and 3.6
+// (WatcherResolver) progressively split this fused stage out.
+//
+// Single goroutine in Phase 3.3 (UploadConcurrency=1 default).
+// Watchers are resolved with the batch's outcome; if the batch
+// carried a flushAck (Producer.Flush emitted it), the same outcome
+// goes to flushAck after watchers are resolved.
+func (p *Producer) uploader() {
+	defer close(p.uploaderDone)
 
-	stats := batch.stats()
-	start := time.Now()
-	entries, metadata, watchers := batch.reset()
-	err := p.writeAndEnqueue(entries, metadata)
-	if p.config.Observer != nil {
-		p.config.Observer.OnFlush(reason, stats, time.Since(start), err)
+	for rb := range p.readyCh {
+		start := time.Now()
+		err := p.writeAndEnqueue(rb.entries, rb.metadata)
+		if p.config.Observer != nil {
+			p.config.Observer.OnFlush(rb.reason, rb.stats, time.Since(start), err)
+		}
+		for _, dw := range rb.watchers {
+			dw.resolve(err)
+		}
+		if rb.flushAck != nil {
+			rb.flushAck <- err
+		}
 	}
-	for _, dw := range watchers {
-		dw.resolve(err)
-	}
-	return err
 }
 
 func (p *Producer) writeAndEnqueue(entries [][]byte, metadata []QueueMetadata) error {
@@ -292,7 +396,7 @@ func (p *Producer) Append(entries [][]byte, metadata []byte) (*WriteHandle, erro
 			p.config.Observer.OnAccepted()
 		}
 		return &WriteHandle{Watcher: watcher}, nil
-	case <-p.done:
+	case <-p.rotatorDone:
 		return nil, ErrShutdown
 	}
 }
@@ -302,7 +406,7 @@ func (p *Producer) Flush(ctx context.Context) error {
 	fm := &flushMessage{result: make(chan error, 1)}
 	select {
 	case p.flushCh <- fm:
-	case <-p.done:
+	case <-p.rotatorDone:
 		return ErrShutdown
 	case <-ctx.Done():
 		return ctx.Err()
@@ -310,6 +414,8 @@ func (p *Producer) Flush(ctx context.Context) error {
 	select {
 	case err := <-fm.result:
 		return err
+	case <-p.uploaderDone:
+		return ErrShutdown
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -326,7 +432,8 @@ func (p *Producer) Close(ctx context.Context) error {
 	p.closeOnce.Do(func() {
 		err = p.Flush(ctx)
 		close(p.appendCh)
-		<-p.done
+		<-p.rotatorDone
+		<-p.uploaderDone
 	})
 	return err
 }
