@@ -212,12 +212,12 @@ type Producer struct {
 	// step 7).
 	resolverCh chan *resolverItem
 
-	rotatorDone     chan struct{}
-	encoderPoolDone chan struct{}
-	uploaderDone    chan struct{}
-	committerDone   chan struct{}
-	resolverDone    chan struct{}
-	closeOnce       sync.Once
+	rotatorDone      chan struct{}
+	encoderPoolDone  chan struct{}
+	uploaderPoolDone chan struct{}
+	committerDone    chan struct{}
+	resolverDone     chan struct{}
+	closeOnce        sync.Once
 
 	// Phase 3.7 metrics state (atomic counters for `workers_busy`).
 	encodeWorkersBusy atomic.Int64
@@ -281,13 +281,13 @@ func NewProducer(store objstore.ObjectStore, config ProducerConfig) *Producer {
 		resolverCh:         make(chan *resolverItem),
 		rotatorDone:        make(chan struct{}),
 		encoderPoolDone:    make(chan struct{}),
-		uploaderDone:       make(chan struct{}),
+		uploaderPoolDone:   make(chan struct{}),
 		committerDone:      make(chan struct{}),
 		resolverDone:       make(chan struct{}),
 	}
 	go p.rotator()
 	go p.encoderPool()
-	go p.uploader()
+	go p.uploaderPool()
 	go p.manifestCommitter()
 	go p.watcherResolver()
 	// Supervisor goroutine: closes resolverCh once all upstream
@@ -502,22 +502,44 @@ func (p *Producer) encoder() {
 	}
 }
 
-// uploader consumes encodedBatch values from encodedCh, runs the
-// data-object PUT, and signals the result to the ManifestCommitter
-// via uploadCompletionCh. See design §3.S3.
+// uploaderPool spawns UploadConcurrency uploader goroutines and
+// closes uploadCompletionCh when all of them have exited. See design
+// §3.S3.
 //
-// Single goroutine in Phase 3.5 (UploadConcurrency=1 default; opting
-// into >1 is structurally fine because the ManifestCommitter
-// re-orders by ordinal). PUT success and PUT failure both flow
-// through uploadCompletionCh — failures carry a non-nil putError so
-// the committer can skip the ordinal in the manifest sequence and
-// resolve the batch's watchers with the error.
-//
-// 3.6 will split the WatcherResolver out of the committer.
-func (p *Producer) uploader() {
-	defer close(p.uploaderDone)
+// With UploadConcurrency>1, uploads finish in arbitrary order — that
+// is the whole point of the parallelism. The ManifestCommitter
+// reorders completions back into ordinal order via its
+// uploadCompletions map (§3.S4); the OOO-upload-completion test in
+// `producer_test.go` (Phase 3.8) is the dedicated check for this
+// reordering invariant.
+func (p *Producer) uploaderPool() {
+	defer close(p.uploaderPoolDone)
 	defer close(p.uploadCompletionCh)
 
+	n := p.config.UploadConcurrency
+	if n < 1 {
+		n = 1
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			p.uploaderWorker()
+		}()
+	}
+	wg.Wait()
+}
+
+// uploaderWorker is one worker in the uploader pool. Reads
+// encodedBatch values from encodedCh, runs the data-object PUT,
+// and signals the result to the ManifestCommitter via
+// uploadCompletionCh. PUT success and PUT failure both flow
+// through uploadCompletionCh — failures carry a non-nil putError
+// so the committer can skip the ordinal in the manifest sequence
+// and resolve the batch's watchers with the error.
+func (p *Producer) uploaderWorker() {
 	for eb := range p.encodedCh {
 		busy := p.uploadWorkersBusy.Add(1)
 		if p.config.Observer != nil {
@@ -538,9 +560,7 @@ func (p *Producer) uploader() {
 		}
 		// Always signal the committer — even on PUT failure — so
 		// the committer can resolve the batch's watchers and skip
-		// the ordinal in the manifest sequence. Blocking send
-		// gives natural backpressure: while the committer is busy
-		// running a CAS, the uploader stops PUTing.
+		// the ordinal in the manifest sequence.
 		p.uploadCompletionCh <- &uploadCompletion{eb: eb, putError: err}
 	}
 }
@@ -818,7 +838,7 @@ func (p *Producer) Close(ctx context.Context) error {
 		close(p.appendCh)
 		<-p.rotatorDone
 		<-p.encoderPoolDone
-		<-p.uploaderDone
+		<-p.uploaderPoolDone
 		<-p.committerDone
 		<-p.resolverDone
 	})
