@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -95,9 +96,11 @@ func TestProducer_concurrent_appends_no_race(t *testing.T) {
 }
 
 // choreographableStore wraps an InMemory ObjectStore and lets a test
-// hold Put() calls until release. PutIfMatch/Get/Delete are
-// passthrough — only Put (the data-object PUT path the uploader
-// uses) is choreographed.
+// hold Put() calls until release. PutIfMatch is also instrumented:
+// a counter on every call (always exposed) plus an optional
+// manifest-CAS gate that holds the first PutIfMatch until released
+// (used by the F3 in-order coalescing test to keep ordinals piling
+// up while the first CAS is in flight). Get/Delete are passthrough.
 //
 // Test usage:
 //
@@ -115,6 +118,16 @@ type choreographableStore struct {
 	pending  map[string]chan struct{} // path -> release channel
 	observed map[string]bool          // paths observed entering Put
 	cond     *sync.Cond
+
+	// PutIfMatch instrumentation. casCount is unconditional; the
+	// optional CAS gate is set up by holdFirstCAS and released by
+	// releaseFirstCAS so the F3 in-order coalescing test can keep
+	// the committer parked on its first CAS while subsequent
+	// upload completions pile up in the buffered uploadCompletionCh.
+	casCount       atomic.Int64
+	firstCASGate   chan struct{} // nil = no gate; closed = gate open; pending = gate closed
+	firstCASSeen   chan struct{} // closed once the first PutIfMatch is observed
+	firstCASActive atomic.Bool   // true while the first CAS is parked at the gate
 }
 
 func newChoreographableStore() *choreographableStore {
@@ -152,11 +165,54 @@ func (s *choreographableStore) Put(ctx context.Context, path string, data []byte
 }
 
 func (s *choreographableStore) PutIfMatch(ctx context.Context, path string, data []byte, version *objstore.Version) error {
+	s.casCount.Add(1)
+	// First-CAS gate: when armed, the very first PutIfMatch parks
+	// here until releaseFirstCAS is called. Subsequent CAS calls
+	// pass through unconditionally.
+	if s.firstCASActive.CompareAndSwap(false, true) {
+		// We are the first CAS. Signal observation, then wait for
+		// release if a gate was set up.
+		if s.firstCASSeen != nil {
+			close(s.firstCASSeen)
+		}
+		if s.firstCASGate != nil {
+			select {
+			case <-s.firstCASGate:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
 	return s.inner.PutIfMatch(ctx, path, data, version)
 }
 
 func (s *choreographableStore) Delete(ctx context.Context, path string) error {
 	return s.inner.Delete(ctx, path)
+}
+
+// holdFirstCAS arms a one-shot gate that blocks the first PutIfMatch
+// call until releaseFirstCAS is called. firstCASSeen() returns a
+// channel closed when the first CAS arrives at the gate.
+func (s *choreographableStore) holdFirstCAS() {
+	s.firstCASGate = make(chan struct{})
+	s.firstCASSeen = make(chan struct{})
+}
+
+// firstCASObserved returns a channel closed when the first PutIfMatch
+// has been observed (after holdFirstCAS was called).
+func (s *choreographableStore) firstCASObserved() <-chan struct{} {
+	return s.firstCASSeen
+}
+
+// releaseFirstCAS opens the gate so the parked first CAS can proceed.
+func (s *choreographableStore) releaseFirstCAS() {
+	close(s.firstCASGate)
+}
+
+// casCalls reports the total PutIfMatch calls observed by the store,
+// including retries.
+func (s *choreographableStore) casCalls() int64 {
+	return s.casCount.Load()
 }
 
 // waitForObserved blocks until all paths starting with `prefix` are
@@ -310,6 +366,119 @@ func TestProducer_uploads_complete_out_of_order(t *testing.T) {
 		// paths[i] — the deterministic ordinal-derived path).
 		if e.Location != paths[i] {
 			t.Fatalf("entries[%d].Location = %q, want %q", i, e.Location, paths[i])
+		}
+	}
+}
+
+// TestProducer_manifest_commit_coalesces_in_order_under_slow_first_CAS
+// is the F3 regression gate: with `ManifestAppendBatchSize > 1`,
+// in-order completions arriving while the committer is busy on a CAS
+// must coalesce into the next CAS instead of each issuing their own.
+//
+// Setup: 32 batches, batchSize=16, UploadConcurrency=32. Hold all
+// data PUTs. Release ordinal 0's PUT first; wait for the committer's
+// first CAS to be observed (parked at the choreographed gate).
+// Release the remaining 31 PUTs; their completions accumulate in the
+// buffered uploadCompletionCh while the first CAS is parked.
+// Release the first CAS. The committer drains the 31 queued
+// completions in two coalesced CAS groups (16 + 15).
+//
+// With the F3 fix (buffered channel + gather-before-drain), the test
+// observes exactly 3 CAS calls (1 for ordinal 0 + 2 coalesced groups).
+// Without the fix (unbuffered channel + drain after each receive),
+// each of the 31 in-order completions triggers its own CAS = 32 total.
+// The asserted bound (≤5) leaves slack for scheduling jitter while
+// still failing dramatically on the unfixed code path.
+func TestProducer_manifest_commit_coalesces_in_order_under_slow_first_CAS(t *testing.T) {
+	const n = 32
+
+	store := newChoreographableStore()
+	store.holdFirstCAS()
+
+	cfg := testConfig()
+	cfg.FlushSizeBytes = 1
+	cfg.EncodeConcurrency = n
+	cfg.UploadConcurrency = n
+	cfg.MaxInFlightBatches = 64 // sized to hold n in flight without backpressure
+	cfg.ManifestAppendBatchSize = 16
+	p := NewProducer(store, cfg)
+	defer func() { _ = p.Close(context.Background()) }()
+
+	prefix := cfg.DataPathPrefix + "/" + p.runID + "/"
+
+	// Submit n Appends. Each becomes its own batch (FlushSizeBytes=1).
+	handles := make([]*WriteHandle, n)
+	for i := 0; i < n; i++ {
+		h, err := p.Append([][]byte{{byte(i % 256)}}, []byte("md"))
+		if err != nil {
+			t.Fatalf("Append[%d]: %v", i, err)
+		}
+		handles[i] = h
+	}
+
+	// Wait until all n PUTs are observed at the choreography gate.
+	if !store.waitForObserved(prefix, n, 5*time.Second) {
+		t.Fatalf("only %d of %d PUTs observed within 5s", len(store.observedPaths()), n)
+	}
+	paths := store.observedPaths()
+
+	// Release ordinal 0's PUT (paths is sorted lexically; the
+	// `<runID>/<ordinal:016x>` format makes lexical order = ordinal
+	// order). The committer receives ordinal 0, drains, and parks
+	// at the held first CAS.
+	store.releasePut(paths[0])
+	select {
+	case <-store.firstCASObserved():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("first CAS never observed; ordinal 0 PUT may not have completed")
+	}
+
+	// Release the remaining 31 PUTs. Their completions queue in the
+	// buffered uploadCompletionCh while the first CAS is parked.
+	for i := 1; i < n; i++ {
+		store.releasePut(paths[i])
+	}
+
+	// Give the upload pool a brief window to push the 31 completions
+	// onto uploadCompletionCh before we release the first CAS. Without
+	// this, the committer may receive ordinal 1 before the rest queue
+	// up, breaking the deterministic 3-CAS expectation. The window is
+	// small relative to test timeout but generous relative to the
+	// in-memory PUT cost (sub-millisecond).
+	time.Sleep(50 * time.Millisecond)
+
+	store.releaseFirstCAS()
+
+	// All watchers resolve.
+	for i, h := range handles {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := h.Watcher.AwaitDurable(ctx); err != nil {
+			cancel()
+			t.Fatalf("watcher[%d]: %v", i, err)
+		}
+		cancel()
+	}
+
+	// Coalescing assertion. With F3 fix: 1 (ordinal 0 alone) + 2
+	// (coalesced 1..31) = 3 CAS calls. Without F3 fix: 32. The bound
+	// of 5 leaves slack for any scheduling-induced split of the
+	// post-release group while still failing on the unfixed path.
+	casCalls := store.casCalls()
+	if casCalls > 5 {
+		t.Fatalf(
+			"expected coalesced CAS count ≤ 5 for n=%d ManifestAppendBatchSize=16; got %d (without F3 fix this is ~%d)",
+			n, casCalls, n,
+		)
+	}
+
+	// Manifest must contain all 32 entries in monotonic order.
+	entries := readManifestEntries(t, store.inner)
+	if len(entries) != n {
+		t.Fatalf("expected %d manifest entries, got %d", n, len(entries))
+	}
+	for i, e := range entries {
+		if e.Sequence != uint64(i) {
+			t.Fatalf("entries[%d].Sequence = %d, want %d", i, e.Sequence, i)
 		}
 	}
 }

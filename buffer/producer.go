@@ -199,9 +199,14 @@ type Producer struct {
 	encodedCh chan *encodedBatch
 	// uploadCompletionCh carries upload outcomes (PUT result + the
 	// encoded batch's metadata) from the Uploader to the
-	// ManifestCommitter. Unbuffered: the Uploader blocks on send
-	// until the Committer picks up. Phase 3.5 (Migration Plan step
-	// 6).
+	// ManifestCommitter. Buffered to `MaxInFlightBatches` so a slow
+	// CAS round trip lets newly-completed uploads accumulate; the
+	// committer gathers all available completions before each drain,
+	// which is what makes `ManifestAppendBatchSize > 1` actually
+	// coalesce in the common case where uploads finish in roughly
+	// arrival order. Without buffering + gather, in-order completions
+	// would each trigger their own CAS regardless of batch size. See
+	// design §Test Plan ("32 ready ordinals → exactly 2 CAS calls").
 	uploadCompletionCh chan *uploadCompletion
 	// resolverCh carries final per-batch outcomes from the Encoder
 	// (encode failures) and ManifestCommitter (commit success / PUT
@@ -268,6 +273,10 @@ type resolverItem struct {
 // for the pipeline contract.
 func NewProducer(store objstore.ObjectStore, config ProducerConfig) *Producer {
 	enqueuer := newManifestEnqueuer(store, config.ManifestPath)
+	completionBuf := config.MaxInFlightBatches
+	if completionBuf < 1 {
+		completionBuf = 1
+	}
 	p := &Producer{
 		enqueuer:           enqueuer,
 		store:              store,
@@ -277,7 +286,7 @@ func NewProducer(store objstore.ObjectStore, config ProducerConfig) *Producer {
 		flushCh:            make(chan *flushMessage),
 		pendingCh:          make(chan *pendingBatch),
 		encodedCh:          make(chan *encodedBatch),
-		uploadCompletionCh: make(chan *uploadCompletion),
+		uploadCompletionCh: make(chan *uploadCompletion, completionBuf),
 		resolverCh:         make(chan *resolverItem),
 		rotatorDone:        make(chan struct{}),
 		encoderPoolDone:    make(chan struct{}),
@@ -696,8 +705,42 @@ func (p *Producer) manifestCommitter() {
 		}
 	}
 
-	for uc := range p.uploadCompletionCh {
+	// gather is the coalescing trigger. After a blocking receive of
+	// the first completion, gather drains every additional completion
+	// already present in the buffered channel without blocking. The
+	// effect: while the committer was busy on the previous CAS, all
+	// completions that arrived behind it accumulate in the channel
+	// buffer, and one `gather + drain` pair turns them into one CAS
+	// group of up to `ManifestAppendBatchSize` ordinals. Without
+	// `gather`, every completion would trigger its own CAS regardless
+	// of batch size — the regression F3 of the rev-2 review.
+	//
+	// Returns true if the channel was closed during gather; the
+	// caller does the post-close final drain.
+	gather := func() bool {
+		for {
+			select {
+			case more, ok := <-p.uploadCompletionCh:
+				if !ok {
+					return true
+				}
+				ready[more.eb.ordinal] = more
+			default:
+				return false
+			}
+		}
+	}
+
+	for {
+		uc, ok := <-p.uploadCompletionCh
+		if !ok {
+			drain()
+			return
+		}
 		ready[uc.eb.ordinal] = uc
+
+		closed := gather()
+
 		// If we have items but `next` hasn't arrived, this is the
 		// start of a head-of-line block.
 		if _, hasNext := ready[next]; !hasNext && holStart.IsZero() {
@@ -713,17 +756,16 @@ func (p *Producer) manifestCommitter() {
 			}
 			holStart = time.Time{}
 		}
+
+		if closed {
+			// Channel closed mid-gather: any straggling ordinals are
+			// already in `ready` (drained above). With holes from an
+			// aborted pipeline, drain returns without committing them
+			// and their watchers were never resolved — matching the
+			// pre-Phase-3 partial-shutdown semantics.
+			return
+		}
 	}
-	// uploadCompletionCh closed: drain any straggling ordinals (with
-	// UploadConcurrency=1, ready is empty here since drain() runs
-	// after each completion; with >1, there may be holes if the
-	// upstream stages aborted mid-flight, in which case the
-	// committer simply returns without committing the orphaned
-	// ordinals — their watchers were never resolved, which signals
-	// shutdown to AwaitDurable callers via the goroutine eventually
-	// dropping. This matches the pre-Phase-3 partial-shutdown
-	// semantics).
-	drain()
 }
 
 // watcherResolver consumes resolverItem values from resolverCh and
