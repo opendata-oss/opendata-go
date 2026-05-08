@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/oklog/ulid/v2"
@@ -217,6 +218,10 @@ type Producer struct {
 	committerDone   chan struct{}
 	resolverDone    chan struct{}
 	closeOnce       sync.Once
+
+	// Phase 3.7 metrics state (atomic counters for `workers_busy`).
+	encodeWorkersBusy atomic.Int64
+	uploadWorkersBusy atomic.Int64
 }
 
 // uploadCompletion is what the Uploader signals to the
@@ -244,6 +249,14 @@ type resolverItem struct {
 	watchers          []*DurabilityWatcher
 	flushAck          chan error
 	err               error
+	// outcome labels the batch's terminal state for the
+	// `buffer.producer.batch_outcome` counter (design §Metrics).
+	// Encoder sets OutcomeEncodeFailed; ManifestCommitter sets
+	// OutcomeUploadFailed (PUT err), OutcomeManifestFailed (CAS
+	// err), or OutcomeCommitted (success). OutcomeAbandoned is
+	// used when the pipeline tears down before the batch terminates
+	// (not currently emitted; reserved for future use).
+	outcome BatchOutcome
 }
 
 // NewProducer creates a new Producer backed by the given ObjectStore.
@@ -444,7 +457,17 @@ func (p *Producer) encoderPool() {
 func (p *Producer) encoder() {
 	for pb := range p.pendingCh {
 		pipelineStartedAt := time.Now()
+		busy := p.encodeWorkersBusy.Add(1)
+		if p.config.Observer != nil {
+			p.config.Observer.OnWorkersBusy(StageEncode, int(busy))
+		}
+		encodeStart := time.Now()
 		payload, err := EncodeBatch(pb.entries, p.config.BatchCompression)
+		busy = p.encodeWorkersBusy.Add(-1)
+		if p.config.Observer != nil {
+			p.config.Observer.OnEncodeDuration(time.Since(encodeStart), err)
+			p.config.Observer.OnWorkersBusy(StageEncode, int(busy))
+		}
 		if err != nil {
 			// Encode failure: hand off to the WatcherResolver
 			// (Phase 3.6) instead of resolving inline. The
@@ -457,6 +480,7 @@ func (p *Producer) encoder() {
 				watchers:          pb.watchers,
 				flushAck:          pb.flushAck,
 				err:               err,
+				outcome:           OutcomeEncodeFailed,
 			}
 			continue
 		}
@@ -495,11 +519,19 @@ func (p *Producer) uploader() {
 	defer close(p.uploadCompletionCh)
 
 	for eb := range p.encodedCh {
+		busy := p.uploadWorkersBusy.Add(1)
+		if p.config.Observer != nil {
+			p.config.Observer.OnWorkersBusy(StageUpload, int(busy))
+		}
 		ctx := context.Background()
 		putStart := time.Now()
 		err := p.store.Put(ctx, eb.location, eb.payload)
+		putDuration := time.Since(putStart)
+		busy = p.uploadWorkersBusy.Add(-1)
 		if p.config.Observer != nil {
-			p.config.Observer.OnStorePut(eb.size, time.Since(putStart), err)
+			p.config.Observer.OnStorePut(eb.size, putDuration, err)
+			p.config.Observer.OnUploadDuration(putDuration, eb.size, err)
+			p.config.Observer.OnWorkersBusy(StageUpload, int(busy))
 		}
 		if err != nil {
 			err = storageErr(err.Error())
@@ -554,11 +586,19 @@ func (p *Producer) manifestCommitter() {
 		batchSize = 1
 	}
 
+	// head-of-line block measurement: when the committer is waiting
+	// for the next-expected ordinal but later ordinals are already
+	// present in `ready`, record the start of the wait; on the next
+	// drain that successfully advances `next`, emit the elapsed.
+	// Zero in the common case (UploadConcurrency=1; completions
+	// arrive in order).
+	var holStart time.Time
+
 	// resolve hands off the batch's outcome to the WatcherResolver
 	// (Phase 3.6 — design §3.S5) so the committer can return to its
 	// loop and start the next CAS without waiting for AwaitDurable
 	// consumers.
-	resolve := func(uc *uploadCompletion, err error) {
+	resolve := func(uc *uploadCompletion, err error, outcome BatchOutcome) {
 		p.resolverCh <- &resolverItem{
 			reason:            uc.eb.reason,
 			stats:             uc.eb.stats,
@@ -566,6 +606,7 @@ func (p *Producer) manifestCommitter() {
 			watchers:          uc.eb.watchers,
 			flushAck:          uc.eb.flushAck,
 			err:               err,
+			outcome:           outcome,
 		}
 	}
 
@@ -610,27 +651,48 @@ func (p *Producer) manifestCommitter() {
 				manifestStart := time.Now()
 				var conflicts int
 				conflicts, casErr = p.enqueuer.enqueueBatch(ctx, items)
+				casDuration := time.Since(manifestStart)
 				if p.config.Observer != nil {
 					totalMeta := 0
 					for _, it := range items {
 						totalMeta += len(it.Metadata)
 					}
-					p.config.Observer.OnManifestEnqueue(totalMeta, time.Since(manifestStart), conflicts, casErr)
+					p.config.Observer.OnManifestEnqueue(totalMeta, casDuration, conflicts, casErr)
+					p.config.Observer.OnManifestAppendBatchSize(len(items))
+					p.config.Observer.OnManifestAppendDuration(casDuration, conflicts, casErr)
 				}
 			}
 
+			groupOutcome := OutcomeCommitted
+			if casErr != nil {
+				groupOutcome = OutcomeManifestFailed
+			}
 			for _, uc := range group {
-				resolve(uc, casErr)
+				resolve(uc, casErr, groupOutcome)
 			}
 			for _, pr := range failed {
-				resolve(pr.uc, pr.err)
+				resolve(pr.uc, pr.err, OutcomeUploadFailed)
 			}
 		}
 	}
 
 	for uc := range p.uploadCompletionCh {
 		ready[uc.eb.ordinal] = uc
+		// If we have items but `next` hasn't arrived, this is the
+		// start of a head-of-line block.
+		if _, hasNext := ready[next]; !hasNext && holStart.IsZero() {
+			holStart = time.Now()
+		}
+		// Snapshot whether the next-expected ordinal is present
+		// before we drain (drain advances `next` on success).
+		_, willAdvance := ready[next]
 		drain()
+		if willAdvance && !holStart.IsZero() {
+			if p.config.Observer != nil {
+				p.config.Observer.OnHeadOfLineBlock(time.Since(holStart))
+			}
+			holStart = time.Time{}
+		}
 	}
 	// uploadCompletionCh closed: drain any straggling ordinals (with
 	// UploadConcurrency=1, ready is empty here since drain() runs
@@ -658,6 +720,9 @@ func (p *Producer) watcherResolver() {
 	for ri := range p.resolverCh {
 		if p.config.Observer != nil {
 			p.config.Observer.OnFlush(ri.reason, ri.stats, time.Since(ri.pipelineStartedAt), ri.err)
+			if ri.outcome != "" {
+				p.config.Observer.OnBatchOutcome(ri.outcome)
+			}
 		}
 		for _, dw := range ri.watchers {
 			dw.resolve(ri.err)
@@ -671,7 +736,22 @@ func (p *Producer) watcherResolver() {
 // Append submits entries and associated metadata for buffering.
 // It returns a WriteHandle whose Watcher can be used to await durability.
 // Applies backpressure when the internal buffer is full.
+//
+// Append blocks indefinitely on `appendCh` send when the byte budget
+// is full. Callers that want a cancellable variant should use
+// AppendContext (Phase 3.7, design rev 2 §Cancellation).
 func (p *Producer) Append(entries [][]byte, metadata []byte) (*WriteHandle, error) {
+	return p.AppendContext(context.Background(), entries, metadata)
+}
+
+// AppendContext is the cancellation-aware variant of Append. See
+// design rev 2 §Cancellation: existing pre-Phase-3 callers stay on
+// the context-free Append; new callers that want to bound the
+// backpressure-block can pass a context here. After the message is
+// enqueued, ctx cancellation does not affect the in-flight batch —
+// the watcher's AwaitDurable(ctx) is the cancellation point for
+// the durable wait.
+func (p *Producer) AppendContext(ctx context.Context, entries [][]byte, metadata []byte) (*WriteHandle, error) {
 	if len(entries) == 0 {
 		return nil, invalidInputErr("entries must not be empty")
 	}
@@ -687,12 +767,16 @@ func (p *Producer) Append(entries [][]byte, metadata []byte) (*WriteHandle, erro
 		watcher:         watcher,
 	}
 
+	blockStart := time.Now()
 	select {
 	case p.appendCh <- msg:
 		if p.config.Observer != nil {
+			p.config.Observer.OnAppendChBlock(time.Since(blockStart))
 			p.config.Observer.OnAccepted()
 		}
 		return &WriteHandle{Watcher: watcher}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	case <-p.rotatorDone:
 		return nil, ErrShutdown
 	}

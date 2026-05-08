@@ -389,3 +389,28 @@ func resultAttr(err error) attribute.KeyValue {
 	}
 	return attribute.String("result", "success")
 }
+
+// Phase 3.7 Observer hooks. The exporter currently emits metrics
+// only for the pre-Phase-3 set; the new buffer.producer.* metrics
+// from design §Metrics are recorded in the buffer crate's own
+// metrics layer (or a future telemetry expansion). These no-op
+// implementations satisfy the extended Observer interface without
+// changing the OTel collector exporter's external contract.
+
+func (t *exporterTelemetry) OnAppendChBlock(time.Duration) {}
+
+func (t *exporterTelemetry) OnWorkersBusy(buffer.PipelineStage, int) {}
+
+func (t *exporterTelemetry) OnEncodeDuration(time.Duration, error) {}
+
+func (t *exporterTelemetry) OnUploadDuration(time.Duration, int, error) {}
+
+func (t *exporterTelemetry) OnManifestAppendBatchSize(int) {}
+
+func (t *exporterTelemetry) OnManifestAppendDuration(time.Duration, int, error) {}
+
+func (t *exporterTelemetry) OnHeadOfLineBlock(time.Duration) {}
+
+func (t *exporterTelemetry) OnBatchOutcome(buffer.BatchOutcome) {}
+
+func (t *exporterTelemetry) OnHalted(bool) {}
