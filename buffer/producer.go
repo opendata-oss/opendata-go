@@ -128,20 +128,17 @@ func (b *batchAccumulator) stats() FlushStats {
 	}
 }
 
-// readyBatch is the unit of work the Rotator emits to the Uploader.
+// pendingBatch is the unit of work the Rotator emits to the Encoder
+// pool (§3.S1 → §3.S2). Encoders consume `pendingBatch` and produce
+// `encodedBatch` after running EncodeBatch.
 //
 // Phase 3.3 of the producer pipelining design (Migration Plan step 4)
-// introduces this two-stage layout: the Rotator owns the accumulator
-// and assigns monotonic ordinals; the Uploader consumes ready batches
-// and runs the existing encode + PUT + manifest CAS + watcher-resolve
-// sequence in one body. Subsequent units split that body further:
-// 3.4 splits the Encoder out (§3.S2), 3.5 splits the ManifestCommitter
-// out (§3.S4), 3.6 splits the WatcherResolver out (§3.S5).
-//
-// The location format change (`<run_id>/<ordinal:016x>` per §3.S2) is
-// deferred to 3.4 alongside the Encoder pool. The `ordinal` field is
-// already populated here so 3.4's diff is local to the Encoder.
-type readyBatch struct {
+// introduced the two-stage layout (Rotator → fused Uploader). Phase
+// 3.4 (Migration Plan step 5; this commit) splits the Encoder out so
+// the post-rotator pipeline is now Rotator → Encoder pool → Uploader.
+// 3.5 splits the ManifestCommitter (§3.S4); 3.6 splits the
+// WatcherResolver (§3.S5).
+type pendingBatch struct {
 	ordinal  uint64
 	entries  [][]byte
 	metadata []QueueMetadata
@@ -155,6 +152,23 @@ type readyBatch struct {
 	flushAck chan error
 }
 
+// encodedBatch is the unit of work the Encoder pool emits to the
+// Uploader. Carries the encoded payload, the deterministic location
+// (computed from runID + ordinal per §3.S2), and a `pipelineStartedAt`
+// timestamp the Uploader uses for OnFlush observer reporting.
+type encodedBatch struct {
+	ordinal           uint64
+	payload           []byte
+	metadata          []QueueMetadata
+	watchers          []*DurabilityWatcher
+	stats             FlushStats
+	reason            FlushReason
+	flushAck          chan error
+	location          string // <data_path_prefix>/<runID>/<ordinal:016x>
+	size              int    // len(payload)
+	pipelineStartedAt time.Time
+}
+
 // Producer accepts opaque byte entries, batches them, and flushes to object
 // storage on size or time thresholds.
 type Producer struct {
@@ -162,59 +176,74 @@ type Producer struct {
 	store    objstore.ObjectStore
 	config   ProducerConfig
 
+	// runID is generated once when the producer starts and is constant
+	// for the producer's lifetime. Used as the per-process prefix in
+	// the data-object location so two restarted producers cannot
+	// collide on a path even if they pick the same ordinals. See
+	// design §3.S2.
+	runID string
+
 	appendCh chan *appendMessage
 	flushCh  chan *flushMessage
-	// readyCh carries ready batches from the Rotator to the Uploader.
-	// Unbuffered: the Rotator blocks on send until the Uploader picks
-	// the batch up. With UploadConcurrency=1 (Phase 3.3 default) this
-	// preserves the pre-Phase-3 single-flight throughput exactly —
-	// while the Uploader is encoding/uploading, the Rotator stops
-	// emitting and (transitively) stops draining appendCh, so
-	// appendCh fills and Append callers block, identical to the
-	// pre-Phase-3 behavior.
-	readyCh chan *readyBatch
+	// pendingCh carries pending batches from the Rotator to the
+	// Encoder pool. Unbuffered: with EncodeConcurrency=1 the Rotator
+	// blocks on send until the Encoder picks the batch up, preserving
+	// the pre-Phase-3 single-flight throughput. With higher
+	// EncodeConcurrency (opt-in), one of the N encoders picks up
+	// each batch as workers free up.
+	pendingCh chan *pendingBatch
+	// encodedCh carries encoded batches from the Encoder pool to the
+	// Uploader. Unbuffered: with UploadConcurrency=1 the Encoder
+	// blocks on send until the Uploader picks up.
+	encodedCh chan *encodedBatch
 
-	rotatorDone  chan struct{}
-	uploaderDone chan struct{}
-	closeOnce    sync.Once
+	rotatorDone     chan struct{}
+	encoderPoolDone chan struct{}
+	uploaderDone    chan struct{}
+	closeOnce       sync.Once
 }
 
 // NewProducer creates a new Producer backed by the given ObjectStore.
 //
-// Spawns one Rotator goroutine + one Uploader goroutine. See
+// Spawns one Rotator goroutine + EncodeConcurrency Encoder goroutines
+// + one Uploader goroutine. See
 // `plans/odb-high-throughput/phase03-producer-pipelining-design.md`
 // for the pipeline contract.
 func NewProducer(store objstore.ObjectStore, config ProducerConfig) *Producer {
 	enqueuer := newManifestEnqueuer(store, config.ManifestPath)
 	p := &Producer{
-		enqueuer:     enqueuer,
-		store:        store,
-		config:       config,
-		appendCh:     make(chan *appendMessage, config.MaxBufferedInputs),
-		flushCh:      make(chan *flushMessage),
-		readyCh:      make(chan *readyBatch),
-		rotatorDone:  make(chan struct{}),
-		uploaderDone: make(chan struct{}),
+		enqueuer:        enqueuer,
+		store:           store,
+		config:          config,
+		runID:           ulid.Make().String(),
+		appendCh:        make(chan *appendMessage, config.MaxBufferedInputs),
+		flushCh:         make(chan *flushMessage),
+		pendingCh:       make(chan *pendingBatch),
+		encodedCh:       make(chan *encodedBatch),
+		rotatorDone:     make(chan struct{}),
+		encoderPoolDone: make(chan struct{}),
+		uploaderDone:    make(chan struct{}),
 	}
 	go p.rotator()
+	go p.encoderPool()
 	go p.uploader()
 	return p
 }
 
 // rotator drains appendCh, manages the open accumulator, assigns
-// monotonic ordinals at rotation time, and emits ready batches to
-// readyCh on size / time / manual-flush / shutdown triggers.
+// monotonic ordinals at rotation time, and emits pending batches to
+// pendingCh on size / time / manual-flush / shutdown triggers.
 //
 // Single goroutine: ordinals are strictly monotonic by construction
 // (no other goroutine increments the counter). See design §3.S1.
 //
 // Lifecycle: when appendCh closes, the rotator emits any open
 // accumulator as a final FlushReasonShutdown batch (or skips if
-// empty), closes readyCh (signaling the uploader to drain and
-// exit), and signals rotatorDone.
+// empty), closes pendingCh (signaling the encoder pool to drain
+// and exit), and signals rotatorDone.
 func (p *Producer) rotator() {
 	defer close(p.rotatorDone)
-	defer close(p.readyCh)
+	defer close(p.pendingCh)
 
 	batch := &batchAccumulator{}
 	var ordinal uint64
@@ -222,9 +251,9 @@ func (p *Producer) rotator() {
 	emit := func(reason FlushReason, flushAck chan error) {
 		if batch.isEmpty() {
 			// For a flush request against an empty accumulator,
-			// signal success immediately without sending to the
-			// uploader. Preserves the pre-Phase-3 behavior of
-			// `Flush` returning nil for an empty buffer.
+			// signal success immediately without sending downstream.
+			// Preserves the pre-Phase-3 behavior of `Flush`
+			// returning nil for an empty buffer.
 			if flushAck != nil {
 				flushAck <- nil
 			}
@@ -232,7 +261,7 @@ func (p *Producer) rotator() {
 		}
 		stats := batch.stats()
 		entries, metadata, watchers := batch.reset()
-		rb := &readyBatch{
+		pb := &pendingBatch{
 			ordinal:  ordinal,
 			entries:  entries,
 			metadata: metadata,
@@ -242,11 +271,12 @@ func (p *Producer) rotator() {
 			flushAck: flushAck,
 		}
 		ordinal++
-		// Blocks until uploader takes it. While blocked, this
+		// Blocks until an encoder picks it up. While blocked, this
 		// goroutine isn't draining appendCh either, so backpressure
-		// propagates through appendCh to Append callers — exactly
-		// matching the pre-Phase-3 single-goroutine behavior.
-		p.readyCh <- rb
+		// propagates through appendCh to Append callers — matching
+		// the pre-Phase-3 single-goroutine behavior at default
+		// concurrency.
+		p.pendingCh <- pb
 	}
 
 	var timer *time.Timer
@@ -315,60 +345,117 @@ func drainAppendChInto(appendCh chan *appendMessage, batch *batchAccumulator) {
 	}
 }
 
-// uploader consumes ready batches from readyCh and runs the existing
-// encode + PUT + manifest CAS + watcher-resolve sequence in one body.
-// Phase 3.4 (Encoder pool), 3.5 (ManifestCommitter), and 3.6
-// (WatcherResolver) progressively split this fused stage out.
+// encoderPool spawns EncodeConcurrency encoder goroutines and closes
+// encodedCh when all of them have exited. See design §3.S2.
 //
-// Single goroutine in Phase 3.3 (UploadConcurrency=1 default).
-// Watchers are resolved with the batch's outcome; if the batch
-// carried a flushAck (Producer.Flush emitted it), the same outcome
-// goes to flushAck after watchers are resolved.
-func (p *Producer) uploader() {
-	defer close(p.uploaderDone)
+// The supervisor pattern is used because multiple encoders read from
+// pendingCh and a single channel close is needed once they're all
+// done. A WaitGroup gates close(encodedCh) on all encoders exiting.
+func (p *Producer) encoderPool() {
+	defer close(p.encoderPoolDone)
+	defer close(p.encodedCh)
 
-	for rb := range p.readyCh {
-		start := time.Now()
-		err := p.writeAndEnqueue(rb.entries, rb.metadata)
-		if p.config.Observer != nil {
-			p.config.Observer.OnFlush(rb.reason, rb.stats, time.Since(start), err)
+	n := p.config.EncodeConcurrency
+	if n < 1 {
+		n = 1
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			p.encoder()
+		}()
+	}
+	wg.Wait()
+}
+
+// encoder is one worker in the encoder pool. Reads pendingBatch
+// values from pendingCh, runs EncodeBatch, computes the deterministic
+// location (`<data_path_prefix>/<runID>/<ordinal:016x>`), and emits
+// encodedBatch values to encodedCh. See design §3.S2.
+//
+// Failure: encode errors fail the batch immediately — watchers and
+// flushAck are resolved with the encode error here, OnFlush fires
+// with the (very short) elapsed time, and the batch is dropped (no
+// encodedCh emit, no manifest entry). The pipeline continues with
+// later batches, matching the design's "pipeline continues with
+// later batches" rule.
+func (p *Producer) encoder() {
+	for pb := range p.pendingCh {
+		pipelineStartedAt := time.Now()
+		payload, err := EncodeBatch(pb.entries, p.config.BatchCompression)
+		if err != nil {
+			if p.config.Observer != nil {
+				p.config.Observer.OnFlush(pb.reason, pb.stats, time.Since(pipelineStartedAt), err)
+			}
+			for _, dw := range pb.watchers {
+				dw.resolve(err)
+			}
+			if pb.flushAck != nil {
+				pb.flushAck <- err
+			}
+			continue
 		}
-		for _, dw := range rb.watchers {
-			dw.resolve(err)
+		eb := &encodedBatch{
+			ordinal:           pb.ordinal,
+			payload:           payload,
+			metadata:          pb.metadata,
+			watchers:          pb.watchers,
+			stats:             pb.stats,
+			reason:            pb.reason,
+			flushAck:          pb.flushAck,
+			location:          fmt.Sprintf("%s/%s/%016x", p.config.DataPathPrefix, p.runID, pb.ordinal),
+			size:              len(payload),
+			pipelineStartedAt: pipelineStartedAt,
 		}
-		if rb.flushAck != nil {
-			rb.flushAck <- err
-		}
+		// Blocks until uploader takes it. With UploadConcurrency=1
+		// default this preserves single-flight throughput.
+		p.encodedCh <- eb
 	}
 }
 
-func (p *Producer) writeAndEnqueue(entries [][]byte, metadata []QueueMetadata) error {
-	payload, err := EncodeBatch(entries, p.config.BatchCompression)
-	if err != nil {
-		return err
-	}
+// uploader consumes encodedBatch values from encodedCh and runs the
+// PUT + manifest CAS + watcher-resolve sequence. See design §3.S3
+// (PUT), §3.S4 fused (manifest CAS), §3.S5 fused (watcher resolve).
+// 3.5 splits ManifestCommitter out; 3.6 splits WatcherResolver out.
+//
+// Single goroutine in Phase 3.4 (UploadConcurrency=1 default).
+// OnFlush duration measures from pipelineStartedAt (when the encoder
+// began processing this batch) through manifest commit, preserving
+// the pre-Phase-3 "writeAndEnqueue duration" semantic.
+func (p *Producer) uploader() {
+	defer close(p.uploaderDone)
 
-	id := ulid.Make()
-	path := fmt.Sprintf("%s/%s.batch", p.config.DataPathPrefix, id.String())
-
-	ctx := context.Background()
-	putStart := time.Now()
-	if err := p.store.Put(ctx, path, payload); err != nil {
+	for eb := range p.encodedCh {
+		ctx := context.Background()
+		putStart := time.Now()
+		err := p.store.Put(ctx, eb.location, eb.payload)
 		if p.config.Observer != nil {
-			p.config.Observer.OnStorePut(len(payload), time.Since(putStart), err)
+			p.config.Observer.OnStorePut(eb.size, time.Since(putStart), err)
 		}
-		return storageErr(err.Error())
-	}
-	if p.config.Observer != nil {
-		p.config.Observer.OnStorePut(len(payload), time.Since(putStart), nil)
-	}
+		if err != nil {
+			err = storageErr(err.Error())
+		} else {
+			manifestStart := time.Now()
+			var conflicts int
+			conflicts, err = p.enqueuer.enqueue(ctx, eb.location, eb.metadata)
+			if p.config.Observer != nil {
+				p.config.Observer.OnManifestEnqueue(len(eb.metadata), time.Since(manifestStart), conflicts, err)
+			}
+		}
 
-	manifestStart := time.Now()
-	conflicts, err := p.enqueuer.enqueue(ctx, path, metadata)
-	if p.config.Observer != nil {
-		p.config.Observer.OnManifestEnqueue(len(metadata), time.Since(manifestStart), conflicts, err)
+		if p.config.Observer != nil {
+			p.config.Observer.OnFlush(eb.reason, eb.stats, time.Since(eb.pipelineStartedAt), err)
+		}
+		for _, dw := range eb.watchers {
+			dw.resolve(err)
+		}
+		if eb.flushAck != nil {
+			eb.flushAck <- err
+		}
 	}
-	return err
 }
 
 // Append submits entries and associated metadata for buffering.
@@ -433,6 +520,7 @@ func (p *Producer) Close(ctx context.Context) error {
 		err = p.Flush(ctx)
 		close(p.appendCh)
 		<-p.rotatorDone
+		<-p.encoderPoolDone
 		<-p.uploaderDone
 	})
 	return err
