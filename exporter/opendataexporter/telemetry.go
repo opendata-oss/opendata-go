@@ -38,6 +38,22 @@ type exporterTelemetry struct {
 	manifestConflictsTotal    metric.Int64Counter
 	manifestConflictsPerWrite metric.Int64Histogram
 
+	// Phase 3.7 buffer.producer.* metric instruments — F5 of Phase 3
+	// rev-2 review. Names mirror design §Metrics with the
+	// `opendataexporter.` namespace prefix to keep them adjacent
+	// to the rest of the exporter's metrics in dashboards.
+	appendChBlockDuration       metric.Float64Histogram
+	workersBusyGauge            metric.Int64Gauge
+	encodeDuration              metric.Float64Histogram
+	uploadDuration              metric.Float64Histogram
+	manifestAppendBatchSize     metric.Int64Histogram
+	manifestAppendDuration      metric.Float64Histogram
+	headOfLineBlockDuration     metric.Float64Histogram
+	batchOutcomeTotal           metric.Int64Counter
+	haltedGauge                 metric.Int64Gauge
+	inflightBytesGauge          metric.Int64Gauge
+	inflightBatchesGauge        metric.Int64Gauge
+
 	slowRequestThreshold time.Duration
 	slowFlushThreshold   time.Duration
 }
@@ -209,6 +225,89 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		return nil, err
 	}
 
+	appendChBlockDuration, err := meter.Float64Histogram(
+		"opendataexporter.append_ch_block_duration_seconds",
+		metric.WithUnit("s"),
+		metric.WithDescription("Time AppendContext spent blocked on the appendCh send (zero in the common no-backpressure case)."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	workersBusyGauge, err := meter.Int64Gauge(
+		"opendataexporter.workers_busy",
+		metric.WithDescription("Current count of busy encoder/uploader workers (one series per stage attribute)."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	encodeDuration, err := meter.Float64Histogram(
+		"opendataexporter.encode_duration_seconds",
+		metric.WithUnit("s"),
+		metric.WithDescription("Per-batch encode wall time."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	uploadDuration, err := meter.Float64Histogram(
+		"opendataexporter.upload_duration_seconds",
+		metric.WithUnit("s"),
+		metric.WithDescription("Per-batch object-PUT wall time (one sample per attempt)."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	manifestAppendBatchSize, err := meter.Int64Histogram(
+		"opendataexporter.manifest_append_batch_size",
+		metric.WithDescription("Ordinals coalesced into a single CAS round trip."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	manifestAppendDuration, err := meter.Float64Histogram(
+		"opendataexporter.manifest_append_duration_seconds",
+		metric.WithUnit("s"),
+		metric.WithDescription("Per-CAS manifest write wall time."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	headOfLineBlockDuration, err := meter.Float64Histogram(
+		"opendataexporter.head_of_line_block_duration_seconds",
+		metric.WithUnit("s"),
+		metric.WithDescription("Time the manifest committer waited for the next-expected ordinal while later ordinals were already ready."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	batchOutcomeTotal, err := meter.Int64Counter(
+		"opendataexporter.batch_outcome_total",
+		metric.WithDescription("Per-batch terminal outcome count (one series per outcome attribute)."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	haltedGauge, err := meter.Int64Gauge(
+		"opendataexporter.halted",
+		metric.WithDescription("1 when the producer has entered the halted state, 0 otherwise."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	inflightBytesGauge, err := meter.Int64Gauge(
+		"opendataexporter.inflight_bytes",
+		metric.WithDescription("Bytes currently reserved against MaxInFlightBytes."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	inflightBatchesGauge, err := meter.Int64Gauge(
+		"opendataexporter.inflight_batches",
+		metric.WithDescription("Batches currently reserved against MaxInFlightBatches."),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	threshold := 2 * cfg.FlushInterval
 	if threshold < 5*time.Second {
 		threshold = 5 * time.Second
@@ -237,6 +336,17 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		manifestEnqueueDuration:   manifestEnqueueDuration,
 		manifestConflictsTotal:    manifestConflictsTotal,
 		manifestConflictsPerWrite: manifestConflictsPerWrite,
+		appendChBlockDuration:     appendChBlockDuration,
+		workersBusyGauge:          workersBusyGauge,
+		encodeDuration:            encodeDuration,
+		uploadDuration:            uploadDuration,
+		manifestAppendBatchSize:   manifestAppendBatchSize,
+		manifestAppendDuration:    manifestAppendDuration,
+		headOfLineBlockDuration:   headOfLineBlockDuration,
+		batchOutcomeTotal:         batchOutcomeTotal,
+		haltedGauge:               haltedGauge,
+		inflightBytesGauge:        inflightBytesGauge,
+		inflightBatchesGauge:      inflightBatchesGauge,
 		slowRequestThreshold:      threshold,
 		slowFlushThreshold:        threshold,
 	}, nil
@@ -390,31 +500,60 @@ func resultAttr(err error) attribute.KeyValue {
 	return attribute.String("result", "success")
 }
 
-// Phase 3.7 Observer hooks. The exporter currently emits metrics
-// only for the pre-Phase-3 set; the new buffer.producer.* metrics
-// from design §Metrics are recorded in the buffer crate's own
-// metrics layer (or a future telemetry expansion). These no-op
-// implementations satisfy the extended Observer interface without
-// changing the OTel collector exporter's external contract.
+// Phase 3.7 Observer hooks: wired to concrete OTel metric instruments
+// per design §Metrics. F5 of Phase 3 rev-2 review (extends
+// buffer.Observer in place — Option (a) of the rev-2 compatibility
+// question).
 
-func (t *exporterTelemetry) OnAppendChBlock(time.Duration) {}
+func (t *exporterTelemetry) OnAppendChBlock(d time.Duration) {
+	t.appendChBlockDuration.Record(context.Background(), d.Seconds())
+}
 
-func (t *exporterTelemetry) OnWorkersBusy(buffer.PipelineStage, int) {}
+func (t *exporterTelemetry) OnWorkersBusy(stage buffer.PipelineStage, busy int) {
+	t.workersBusyGauge.Record(context.Background(), int64(busy),
+		metric.WithAttributes(attribute.String("stage", string(stage))))
+}
 
-func (t *exporterTelemetry) OnEncodeDuration(time.Duration, error) {}
+func (t *exporterTelemetry) OnEncodeDuration(d time.Duration, err error) {
+	t.encodeDuration.Record(context.Background(), d.Seconds(),
+		metric.WithAttributes(resultAttr(err)))
+}
 
-func (t *exporterTelemetry) OnUploadDuration(time.Duration, int, error) {}
+func (t *exporterTelemetry) OnUploadDuration(d time.Duration, _ int, err error) {
+	t.uploadDuration.Record(context.Background(), d.Seconds(),
+		metric.WithAttributes(resultAttr(err)))
+}
 
-func (t *exporterTelemetry) OnManifestAppendBatchSize(int) {}
+func (t *exporterTelemetry) OnManifestAppendBatchSize(n int) {
+	t.manifestAppendBatchSize.Record(context.Background(), int64(n))
+}
 
-func (t *exporterTelemetry) OnManifestAppendDuration(time.Duration, int, error) {}
+func (t *exporterTelemetry) OnManifestAppendDuration(d time.Duration, _ int, err error) {
+	t.manifestAppendDuration.Record(context.Background(), d.Seconds(),
+		metric.WithAttributes(resultAttr(err)))
+}
 
-func (t *exporterTelemetry) OnHeadOfLineBlock(time.Duration) {}
+func (t *exporterTelemetry) OnHeadOfLineBlock(d time.Duration) {
+	t.headOfLineBlockDuration.Record(context.Background(), d.Seconds())
+}
 
-func (t *exporterTelemetry) OnBatchOutcome(buffer.BatchOutcome) {}
+func (t *exporterTelemetry) OnBatchOutcome(outcome buffer.BatchOutcome) {
+	t.batchOutcomeTotal.Add(context.Background(), 1,
+		metric.WithAttributes(attribute.String("outcome", string(outcome))))
+}
 
-func (t *exporterTelemetry) OnHalted(bool) {}
+func (t *exporterTelemetry) OnHalted(halted bool) {
+	v := int64(0)
+	if halted {
+		v = 1
+	}
+	t.haltedGauge.Record(context.Background(), v)
+}
 
-func (t *exporterTelemetry) OnInflightBytes(int64) {}
+func (t *exporterTelemetry) OnInflightBytes(bytes int64) {
+	t.inflightBytesGauge.Record(context.Background(), bytes)
+}
 
-func (t *exporterTelemetry) OnInflightBatches(int) {}
+func (t *exporterTelemetry) OnInflightBatches(batches int) {
+	t.inflightBatchesGauge.Record(context.Background(), int64(batches))
+}
