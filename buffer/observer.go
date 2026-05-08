@@ -117,4 +117,11 @@ type Observer interface {
 	// reserved against `MaxInFlightBatches` after a release event.
 	// Emitted alongside OnInflightBytes.
 	OnInflightBatches(batches int)
+
+	// OnQueueDepth reports the current queue / in-flight count for
+	// a pipeline stage. Wired to design §Metrics
+	// `buffer.producer.queue_depth`. Emitted at stage entry/exit
+	// transitions; uses channel lengths as an eventually-consistent
+	// proxy for the queue depth. F4 of Phase 3 rev-3 review.
+	OnQueueDepth(stage PipelineStage, depth int)
 }

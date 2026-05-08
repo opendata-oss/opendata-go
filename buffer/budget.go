@@ -43,6 +43,15 @@ type producerBudget struct {
 	// the next contended reserve/acquire. nil when no waiter has
 	// asked for a wakeup.
 	waiter chan struct{}
+
+	// drainCh is closed when batchesUsed transitions to 0. Allocated
+	// lazily by waitDrained when batchesUsed > 0; closed and reset
+	// to nil by release when batchesUsed reaches 0. Used by
+	// Producer.Flush to block until every in-flight batch has
+	// terminated, per design §"Producer.Flush(ctx) blocks until
+	// every in-flight batch has either committed or failed". F1 of
+	// Phase 3 rev-3 review.
+	drainCh chan struct{}
 }
 
 func newProducerBudget(maxBytes, maxBatches int) *producerBudget {
@@ -114,7 +123,9 @@ func (b *producerBudget) acquireBatchSlot(shutdown <-chan struct{}) error {
 // release returns `bytes` and `batches` worth of capacity to the
 // budget. Always wakes any pending waiters because either path could
 // have been the limiting one. Called by the WatcherResolver per
-// terminal batch outcome with `(batch.byteCost, 1)`.
+// terminal batch outcome with `(batch.byteCost, 1)`. If batchesUsed
+// drops to 0, also closes the drainCh waiter (if any) so a pending
+// Flush can return.
 func (b *producerBudget) release(bytes int64, batches int64) {
 	b.mu.Lock()
 	b.bytesUsed -= bytes
@@ -129,7 +140,43 @@ func (b *producerBudget) release(bytes int64, batches int64) {
 		close(ch)
 		b.waiter = nil
 	}
+	if b.batchesUsed == 0 && b.drainCh != nil {
+		close(b.drainCh)
+		b.drainCh = nil
+	}
 	b.mu.Unlock()
+}
+
+// waitDrained blocks until batchesUsed reaches 0, returning nil. If
+// batchesUsed is already 0, returns immediately. Returns ctx.Err()
+// or ErrShutdown if those fire first. Per design: "Flush(ctx)
+// blocks until every in-flight batch has either committed or
+// failed." F1 of Phase 3 rev-3 review.
+func (b *producerBudget) waitDrained(ctx context.Context, shutdown <-chan struct{}) error {
+	for {
+		b.mu.Lock()
+		if b.batchesUsed == 0 {
+			b.mu.Unlock()
+			return nil
+		}
+		if b.drainCh == nil {
+			b.drainCh = make(chan struct{})
+		}
+		ch := b.drainCh
+		b.mu.Unlock()
+
+		select {
+		case <-ch:
+			// batchesUsed transitioned to 0 — re-check under the
+			// lock because a new acquire may have raced ahead. If
+			// we're still at 0, return; otherwise wait again on a
+			// fresh drainCh.
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-shutdown:
+			return ErrShutdown
+		}
+	}
 }
 
 // snapshot returns the current (bytesUsed, batchesUsed) for metric
@@ -138,6 +185,29 @@ func (b *producerBudget) snapshot() (int64, int64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.bytesUsed, b.batchesUsed
+}
+
+// addReservation increments bytesUsed by `extra` (which may be
+// negative) without blocking. Used by the Rotator at emit-time
+// reconciliation to charge the per-batch framing overhead that
+// `appendByteCost` does not capture (per-entry length prefix +
+// per-batch footer). Per design §Backpressure step (b): "the
+// reservation is reconciled to the accumulator's actual byte count
+// (entries + metadata + buffer framing)". May transiently exceed
+// `MaxInFlightBytes` by up to ~`MaxInFlightBatches * (4 * entries +
+// 7)` bytes — bounded and small relative to the cap. F2 of Phase 3
+// rev-3 review.
+func (b *producerBudget) addReservation(extra int64) {
+	b.mu.Lock()
+	b.bytesUsed += extra
+	if b.bytesUsed < 0 {
+		b.bytesUsed = 0
+	}
+	if ch := b.waiter; ch != nil {
+		close(ch)
+		b.waiter = nil
+	}
+	b.mu.Unlock()
 }
 
 // ensureWaiterLocked returns the current waiter channel, allocating

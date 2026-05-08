@@ -282,15 +282,25 @@ type Producer struct {
 // or failure). The Committer holds these in an ordinal-indexed map
 // and drains them in monotonic order, coalescing up to
 // ManifestAppendBatchSize ready ordinals into one CAS round trip.
+//
+// Encode failures also flow through this channel as synthetic
+// completions (eb constructed from the pendingBatch with a nil
+// payload, putError = encode error, encodeFailed = true). Without
+// this signal the committer's `next` cursor would block forever on
+// the missing ordinal — F3 of the Phase 3 rev-3 review (design
+// §Failure / "Skipping ordinals").
 type uploadCompletion struct {
-	eb       *encodedBatch
-	putError error // non-nil if the PUT failed; the committer skips the ordinal but resolves watchers
+	eb           *encodedBatch
+	putError     error // non-nil if the PUT or encode failed; the committer skips the ordinal but resolves watchers
+	encodeFailed bool  // true if the failure happened in the encoder (not the uploader); chooses OutcomeEncodeFailed vs OutcomeUploadFailed
 }
 
-// resolverItem is what an upstream stage (Encoder on encode failure,
-// or ManifestCommitter on commit success / commit failure / PUT
-// failure) sends to the WatcherResolver. The resolver calls
-// OnFlush, resolves all watchers with `err`, and signals flushAck.
+// resolverItem is what the ManifestCommitter sends to the
+// WatcherResolver when a batch terminates: commit success, CAS
+// failure, upload (PUT) failure, or encode failure routed through
+// the committer as a synthetic completion (F3 of Phase 3 rev-3
+// review). The resolver calls OnFlush, resolves all watchers with
+// `err`, and signals flushAck.
 //
 // Phase 3.6 (Migration Plan step 7) splits this out of the
 // ManifestCommitter so the committer can move on to the next CAS
@@ -327,15 +337,34 @@ type resolverItem struct {
 func NewProducer(store objstore.ObjectStore, config ProducerConfig) *Producer {
 	// Apply defaults for the Phase-3 fields that may be unset when
 	// callers build a ProducerConfig literally (e.g. test code that
-	// pre-dates these knobs). This keeps the budget meaningful even
-	// for partial configs while still letting callers opt into
-	// tighter caps explicitly. Production code should call
-	// DefaultProducerConfig() and override.
+	// pre-dates these knobs). This keeps the budget + retry budgets
+	// meaningful even for partial configs while still letting
+	// callers opt into tighter caps explicitly. Production code
+	// should call DefaultProducerConfig() and override.
+	//
+	// F6 of Phase 3 rev-3 review: previously DefaultUploadMaxAttempts
+	// and DefaultManifestMaxAttempts (both 6) were declared but only
+	// applied for callers using DefaultProducerConfig(). Callers
+	// constructing ProducerConfig literals silently got the local
+	// "unset → 1" fallback in putWithRetry / manifestCommitter,
+	// which meant no retry budget at all.
 	if config.MaxInFlightBytes < 1 {
 		config.MaxInFlightBytes = DefaultMaxInFlightBytes
 	}
 	if config.MaxInFlightBatches < 1 {
 		config.MaxInFlightBatches = DefaultMaxInFlightBatches
+	}
+	if config.UploadMaxAttempts < 1 {
+		config.UploadMaxAttempts = DefaultUploadMaxAttempts
+	}
+	if config.UploadInitialBackoff <= 0 {
+		config.UploadInitialBackoff = DefaultUploadInitialBackoff
+	}
+	if config.ManifestMaxAttempts < 1 {
+		config.ManifestMaxAttempts = DefaultManifestMaxAttempts
+	}
+	if config.ManifestInitialBackoff <= 0 {
+		config.ManifestInitialBackoff = DefaultManifestInitialBackoff
 	}
 	enqueuer := newManifestEnqueuer(store, config.ManifestPath)
 	completionBuf := config.MaxInFlightBatches
@@ -367,12 +396,13 @@ func NewProducer(store objstore.ObjectStore, config ProducerConfig) *Producer {
 	go p.uploaderPool()
 	go p.manifestCommitter()
 	go p.watcherResolver()
-	// Supervisor goroutine: closes resolverCh once all upstream
-	// senders (encoder pool + manifest committer) have exited. This
-	// is the standard pattern for closing a fan-in channel with
-	// multiple producers.
+	// Supervisor goroutine: closes resolverCh after the committer
+	// (the only sender) exits. The committer is downstream of the
+	// encoder pool and uploader pool, so its exit implies upstream
+	// stages have already drained. F3 of Phase 3 rev-3 review
+	// removed the encoder→resolver direct path, leaving the
+	// committer as the single resolver sender.
 	go func() {
-		<-p.encoderPoolDone
 		<-p.committerDone
 		close(p.resolverCh)
 	}()
@@ -430,6 +460,18 @@ func (p *Producer) rotator() {
 		}
 		stats := batch.stats()
 		entries, metadata, watchers, byteCost := batch.reset()
+		// Reconcile the per-message byte reservation to the
+		// accumulator's actual framed byte cost: per-entry length
+		// prefix (batchEntryLenSize bytes per entry) + per-batch
+		// footer (batchFooterSize bytes). Per design §Backpressure
+		// step (b): "the reservation is reconciled to the
+		// accumulator's actual byte count (entries + metadata +
+		// buffer framing)". Without this, many tiny records
+		// undercount the budget and may blow MaxInFlightBytes
+		// during encoding (F2 of Phase 3 rev-3 review).
+		framingExtra := int64(batchEntryLenSize)*int64(len(entries)) + int64(batchFooterSize)
+		framedCost := byteCost + framingExtra
+		p.budget.addReservation(framingExtra)
 		pb := &pendingBatch{
 			ordinal:  ordinal,
 			entries:  entries,
@@ -438,7 +480,7 @@ func (p *Producer) rotator() {
 			stats:    stats,
 			reason:   reason,
 			flushAck: flushAck,
-			byteCost: byteCost,
+			byteCost: framedCost,
 		}
 		ordinal++
 		// Blocks until an encoder picks it up. While blocked, this
@@ -447,6 +489,9 @@ func (p *Producer) rotator() {
 		// the pre-Phase-3 single-goroutine behavior at default
 		// concurrency.
 		p.pendingCh <- pb
+		if p.config.Observer != nil {
+			p.config.Observer.OnQueueDepth(StageEncode, len(p.pendingCh))
+		}
 	}
 
 	var timer *time.Timer
@@ -567,20 +612,34 @@ func (p *Producer) encoder() {
 			p.config.Observer.OnWorkersBusy(StageEncode, int(busy))
 		}
 		if err != nil {
-			// Encode failure: hand off to the WatcherResolver
-			// (Phase 3.6) instead of resolving inline. The
-			// resolver calls OnFlush, resolves watchers, and
-			// signals flushAck. byteCost is carried so the
-			// resolver releases the budget reservation.
-			p.resolverCh <- &resolverItem{
-				reason:            pb.reason,
-				stats:             pb.stats,
-				pipelineStartedAt: pipelineStartedAt,
+			// Encode failure: route through the ManifestCommitter
+			// as a synthetic completion so the committer can
+			// advance its `next` cursor past this ordinal. Without
+			// this, the committer would block forever on the
+			// missing ordinal and any later batches would stack
+			// up in `ready[]` — F3 of Phase 3 rev-3 review.
+			//
+			// The committer's `failed` path resolves the batch's
+			// watchers via the WatcherResolver (with
+			// OutcomeEncodeFailed when uc.encodeFailed is set),
+			// releases the byte budget, and skips the ordinal in
+			// the CAS group.
+			eb := &encodedBatch{
+				ordinal:           pb.ordinal,
+				payload:           nil,
+				metadata:          pb.metadata,
 				watchers:          pb.watchers,
+				stats:             pb.stats,
+				reason:            pb.reason,
 				flushAck:          pb.flushAck,
-				err:               err,
-				outcome:           OutcomeEncodeFailed,
+				location:          "",
+				size:              0,
+				pipelineStartedAt: pipelineStartedAt,
 				byteCost:          pb.byteCost,
+			}
+			p.uploadCompletionCh <- &uploadCompletion{eb: eb, putError: err, encodeFailed: true}
+			if p.config.Observer != nil {
+				p.config.Observer.OnQueueDepth(StageCommit, len(p.uploadCompletionCh))
 			}
 			continue
 		}
@@ -600,6 +659,9 @@ func (p *Producer) encoder() {
 		// Blocks until uploader takes it. With UploadConcurrency=1
 		// default this preserves single-flight throughput.
 		p.encodedCh <- eb
+		if p.config.Observer != nil {
+			p.config.Observer.OnQueueDepth(StageUpload, len(p.encodedCh))
+		}
 	}
 }
 
@@ -665,6 +727,9 @@ func (p *Producer) uploaderWorker() {
 		// the committer can resolve the batch's watchers and skip
 		// the ordinal in the manifest sequence.
 		p.uploadCompletionCh <- &uploadCompletion{eb: eb, putError: err}
+		if p.config.Observer != nil {
+			p.config.Observer.OnQueueDepth(StageCommit, len(p.uploadCompletionCh))
+		}
 	}
 }
 
@@ -755,8 +820,9 @@ func (p *Producer) manifestCommitter() {
 	defer close(p.committerDone)
 
 	type pendingResolution struct {
-		uc  *uploadCompletion
-		err error // result to resolve watchers with (CAS err, putError, or nil on success)
+		uc      *uploadCompletion
+		err     error // result to resolve watchers with (CAS err, putError, or nil on success)
+		outcome BatchOutcome
 	}
 
 	next := uint64(0)
@@ -863,7 +929,11 @@ func (p *Producer) manifestCommitter() {
 				delete(ready, next)
 				next++
 				if uc.putError != nil {
-					failed = append(failed, pendingResolution{uc: uc, err: uc.putError})
+					outcome := OutcomeUploadFailed
+					if uc.encodeFailed {
+						outcome = OutcomeEncodeFailed
+					}
+					failed = append(failed, pendingResolution{uc: uc, err: uc.putError, outcome: outcome})
 				} else {
 					group = append(group, uc)
 				}
@@ -910,7 +980,7 @@ func (p *Producer) manifestCommitter() {
 					resolve(uc, ErrProducerHalted, OutcomeManifestFailed)
 				}
 				for _, pr := range failed {
-					resolve(pr.uc, pr.err, OutcomeUploadFailed)
+					resolve(pr.uc, pr.err, pr.outcome)
 				}
 				for _, uc := range ready {
 					resolve(uc, ErrProducerHalted, OutcomeAbandoned)
@@ -927,7 +997,7 @@ func (p *Producer) manifestCommitter() {
 				resolve(uc, casErr, groupOutcome)
 			}
 			for _, pr := range failed {
-				resolve(pr.uc, pr.err, OutcomeUploadFailed)
+				resolve(pr.uc, pr.err, pr.outcome)
 			}
 		}
 	}
@@ -1103,6 +1173,7 @@ func (p *Producer) AppendContext(ctx context.Context, entries [][]byte, metadata
 		if p.config.Observer != nil {
 			p.config.Observer.OnAppendChBlock(time.Since(blockStart))
 			p.config.Observer.OnAccepted()
+			p.config.Observer.OnQueueDepth(StageAppend, len(p.appendCh))
 		}
 		return &WriteHandle{Watcher: watcher}, nil
 	case <-ctx.Done():
@@ -1116,7 +1187,28 @@ func (p *Producer) AppendContext(ctx context.Context, entries [][]byte, metadata
 	}
 }
 
-// Flush forces a flush of the current batch, blocking until it is durably written.
+// Flush forces a flush of the current batch and blocks until every
+// in-flight batch has either committed or failed. Per design
+// phase03-producer-pipelining-design.md §"Producer.Flush(ctx) blocks
+// until every in-flight batch has either committed or failed.
+// Forces a final manifest CAS even if the current commit-pending
+// queue is below ManifestAppendBatchSize."
+//
+// Two-phase wait (F1 of Phase 3 rev-3 review):
+//  1. Send the flushMessage and wait for the rotator's flushAck.
+//     This ensures the open accumulator (if any) has been emitted as
+//     a final batch under FlushReasonManual.
+//  2. Wait for the budget's in-flight batch counter to drain to 0.
+//     This catches batches that were already in flight (size/time
+//     triggers) when Flush was called but had not yet terminated.
+//
+// Without phase 2, Flush would return as soon as the rotator's
+// flush batch committed — which can happen before earlier-emitted
+// size/time batches finish, because the manifest committer's strict
+// ordinal ordering only fires after the entire commit chain
+// completes. The empty-accumulator case (where the rotator signals
+// flushAck immediately without emitting a batch) was the loudest
+// failure mode: Flush would return nil with batches still uploading.
 func (p *Producer) Flush(ctx context.Context) error {
 	fm := &flushMessage{result: make(chan error, 1)}
 	select {
@@ -1126,9 +1218,9 @@ func (p *Producer) Flush(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	var flushErr error
 	select {
-	case err := <-fm.result:
-		return err
+	case flushErr = <-fm.result:
 	case <-p.resolverDone:
 		// Pipeline torn down before the resolver delivered the
 		// outcome — the flushed batch's watchers were never resolved
@@ -1137,6 +1229,13 @@ func (p *Producer) Flush(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	// Phase 2: wait for any other in-flight batches (size/time
+	// triggers from before Flush was called) to terminate. Returns
+	// ctx.Err() if the caller cancels mid-wait.
+	if err := p.budget.waitDrained(ctx, p.shutdownCh); err != nil {
+		return err
+	}
+	return flushErr
 }
 
 // ConflictRate returns the percentage of manifest writes that encountered a conflict.

@@ -533,6 +533,7 @@ func (o *haltObserver) OnHeadOfLineBlock(time.Duration)                       {}
 func (o *haltObserver) OnBatchOutcome(BatchOutcome)                           {}
 func (o *haltObserver) OnInflightBytes(int64)                                 {}
 func (o *haltObserver) OnInflightBatches(int)                                 {}
+func (o *haltObserver) OnQueueDepth(PipelineStage, int)                       {}
 func (o *haltObserver) OnHalted(halted bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -911,5 +912,84 @@ func TestProducer_manifest_commit_coalesces_in_order_under_slow_first_CAS(t *tes
 		if e.Sequence != uint64(i) {
 			t.Fatalf("entries[%d].Sequence = %d, want %d", i, e.Sequence, i)
 		}
+	}
+}
+
+// TestProducer_Flush_waits_for_in_flight_size_triggered_batch is the
+// F1 regression test from Phase 3 rev-3 review.
+//
+// Scenario:
+//  1. FlushSizeBytes=1: the first Append immediately triggers a
+//     size-rotation. The accumulator drains.
+//  2. The choreographable store holds the PUT, so the batch is
+//     parked in the uploader and the watcher is unresolved.
+//  3. The caller invokes Flush. The accumulator is now empty, so
+//     the rotator's empty-accumulator path signals flushAck<-nil
+//     immediately.
+//  4. Without the fix: Flush returns nil while the size-triggered
+//     batch is still uploading — violating the design contract
+//     "Flush(ctx) blocks until every in-flight batch has either
+//     committed or failed".
+//  5. With the fix: Flush returns flushAck, then waits on the
+//     budget's drain signal. It only returns once the held PUT
+//     releases and the watcher resolves.
+func TestProducer_Flush_waits_for_in_flight_size_triggered_batch(t *testing.T) {
+	store := newChoreographableStore()
+	cfg := testConfig()
+	cfg.FlushSizeBytes = 1 // every Append triggers a size rotation
+	p := NewProducer(store, cfg)
+	defer func() { _ = p.Close(context.Background()) }()
+
+	prefix := cfg.DataPathPrefix + "/" + p.runID + "/"
+
+	h, err := p.Append([][]byte{[]byte("entry")}, []byte("md"))
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	// Wait for the size-triggered batch to reach the uploader, where
+	// the choreographable store parks it on Put.
+	if !store.waitForObserved(prefix, 1, 5*time.Second) {
+		t.Fatalf("PUT never observed; the size-triggered batch did not reach the uploader")
+	}
+
+	// At this point: accumulator is empty (the size-triggered batch
+	// left), one batch is in flight (parked on Put).
+
+	// Run Flush in a goroutine with a tight timeout. Without the F1
+	// fix, Flush returns nil within microseconds.
+	flushDone := make(chan error, 1)
+	go func() {
+		flushDone <- p.Flush(context.Background())
+	}()
+
+	select {
+	case err := <-flushDone:
+		t.Fatalf("Flush returned %v while a size-triggered batch was still in flight; F1 regression", err)
+	case <-time.After(200 * time.Millisecond):
+		// Expected: Flush is blocked waiting for the in-flight batch.
+	}
+
+	// Release the held PUT so the in-flight batch can commit.
+	paths := store.observedPaths()
+	if len(paths) == 0 {
+		t.Fatalf("no observed PUT paths")
+	}
+	store.releasePut(paths[0])
+
+	select {
+	case err := <-flushDone:
+		if err != nil {
+			t.Fatalf("Flush returned error after release: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Flush did not return within 5s after PUT release")
+	}
+
+	// And the original watcher resolved.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := h.Watcher.AwaitDurable(ctx); err != nil {
+		t.Fatalf("watcher AwaitDurable: %v", err)
 	}
 }

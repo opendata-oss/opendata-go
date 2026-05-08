@@ -53,8 +53,13 @@ type args struct {
 	encodeConcurrency       int
 	uploadConcurrency       int
 	manifestAppendBatchSize int
-	variedParamName         string
-	variedParamValues       string
+	// varied_param fields per benchmarks.md schema v2:
+	// {kind, name, baseline, candidate}. F5 of Phase 3 rev-3 review
+	// (the rev-2 implementation wrote {name, values}).
+	variedParamKind      string
+	variedParamName      string
+	variedParamBaseline  string
+	variedParamCandidate string
 }
 
 func parseArgs() args {
@@ -73,8 +78,10 @@ func parseArgs() args {
 	flag.IntVar(&a.encodeConcurrency, "encode-concurrency", 1, "EncodeConcurrency (Phase 3.4+)")
 	flag.IntVar(&a.uploadConcurrency, "upload-concurrency", 1, "UploadConcurrency (Phase 3.3+)")
 	flag.IntVar(&a.manifestAppendBatchSize, "manifest-append-batch-size", 1, "ManifestAppendBatchSize (Phase 3.5+)")
-	flag.StringVar(&a.variedParamName, "varied-param-name", "", "metadata.varied_param.name (e.g. ManifestAppendBatchSize) — required to populate varied_param")
-	flag.StringVar(&a.variedParamValues, "varied-param-values", "", "comma-separated values for metadata.varied_param.values (e.g. 1,16)")
+	flag.StringVar(&a.variedParamKind, "varied-param-kind", "", "metadata.varied_param.kind: config|code|schema|infra (required to populate varied_param)")
+	flag.StringVar(&a.variedParamName, "varied-param-name", "", "metadata.varied_param.name: dotted path or short ident (e.g. ManifestAppendBatchSize)")
+	flag.StringVar(&a.variedParamBaseline, "varied-param-baseline", "", "metadata.varied_param.baseline: the control value (e.g. 1)")
+	flag.StringVar(&a.variedParamCandidate, "varied-param-candidate", "", "metadata.varied_param.candidate: the variant value (e.g. 16)")
 	flag.Parse()
 	if a.outputDir == "" {
 		fmt.Fprintln(os.Stderr, "--output-dir is required")
@@ -726,30 +733,31 @@ func main() {
 	fmt.Printf("Wrote artifacts to %s\n", runDir)
 }
 
-// variedParamObject constructs the metadata.varied_param block from
-// the --varied-param-name and --varied-param-values flags. Returns
-// nil when either flag is empty (the bench was a non-A/B run with
-// no swept parameter).
+// variedParamObject constructs the metadata.varied_param block per
+// the schema-v2 contract from plans/odb-high-throughput/benchmarks.md
+// §"varied_param":
 //
-// Format matches the schema-v2 contract from
-// plans/odb-high-throughput/benchmarks.md: a structured object with
-// `name` and `values` so downstream tooling can group / pivot
-// without parsing free-text notes.
+//	{ "kind": "config|code|schema|infra",
+//	  "name": "<dotted path or short ident>",
+//	  "baseline": <control value>,
+//	  "candidate": <variant value> }
+//
+// Returns nil when any of the four fields is empty (the bench was a
+// non-A/B run with no swept parameter, or the harness invocation
+// did not pass the new flags).
+//
+// F5 of Phase 3 rev-3 review: the rev-2 implementation emitted
+// `{name, values}`, which violated the benchmarks.md schema and
+// would have caused the gate reviewer to reject the artifact.
 func variedParamObject(a args) any {
-	if a.variedParamName == "" || a.variedParamValues == "" {
+	if a.variedParamKind == "" || a.variedParamName == "" || a.variedParamBaseline == "" || a.variedParamCandidate == "" {
 		return nil
 	}
-	values := []any{}
-	for _, v := range strings.Split(a.variedParamValues, ",") {
-		v = strings.TrimSpace(v)
-		if v == "" {
-			continue
-		}
-		values = append(values, v)
-	}
 	return map[string]any{
-		"name":   a.variedParamName,
-		"values": values,
+		"kind":      a.variedParamKind,
+		"name":      a.variedParamName,
+		"baseline":  a.variedParamBaseline,
+		"candidate": a.variedParamCandidate,
 	}
 }
 
