@@ -23,6 +23,7 @@ go.work.sum
 
 # Build output
 bin/
+otel-collector/_build/
 
 # Rust build output
 **/target/
