@@ -1,0 +1,56 @@
+# OTel Collector Builder (ocb) manifest — produces a custom collector
+# binary that bundles the in-repo `opendataexporter` alongside the
+# standard OTLP receiver + batching processor surface used by the
+# Phase 8 perf-rig cell gateway.
+#
+# Component versions are pinned to the v1.55.0 stable / v0.152.0
+# unstable line because that's what `exporter/opendataexporter/go.mod`
+# already imports — keeping them in lockstep avoids the dependency
+# resolution conflicts OCB raises when collector core libraries split
+# across two major versions.
+#
+# Build locally with:
+#   go install go.opentelemetry.io/collector/cmd/builder@v0.152.0
+#   builder --config otel-collector/builder-config.yaml
+#
+# CI (`.github/workflows/build-otel-collector.yml`) does the same and
+# bakes the output into `ghcr.io/opendata-oss/otel-collector`.
+
+dist:
+  module: github.com/opendata-oss/opendata-go/otel-collector
+  name: otelcol-opendata
+  description: OTel collector bundling the OpenData exporter for the Phase 8 perf rig.
+  # Always relative to the cwd `builder` is invoked from. Build commands
+  # (Dockerfile + README) invoke `builder` from the repo root so this
+  # lands at `<repo-root>/otel-collector/_build/`. The `replaces` paths
+  # below are relative to the generated `_build/go.mod`, so they
+  # assume this layout.
+  output_path: ./otel-collector/_build
+  version: 0.0.1
+
+receivers:
+  - gomod: go.opentelemetry.io/collector/receiver/otlpreceiver v0.152.0
+
+processors:
+  - gomod: go.opentelemetry.io/collector/processor/batchprocessor v0.152.0
+  - gomod: go.opentelemetry.io/collector/processor/memorylimiterprocessor v0.152.0
+
+exporters:
+  - gomod: github.com/opendata-oss/opendata-go/exporter/opendataexporter v0.2.0
+  - gomod: go.opentelemetry.io/collector/exporter/debugexporter v0.152.0
+
+extensions:
+  - gomod: go.opentelemetry.io/collector/extension/zpagesextension v0.152.0
+
+# Replace the opendataexporter module reference with the in-tree path
+# so the builder picks up local changes (incl. unreleased producer
+# additions like `OldestUnflushedBatchAge`). Also pins the underlying
+# opendata-go module to the local checkout so the exporter's
+# `opendata-go v0.2.0` import resolves locally rather than against the
+# crates.io-equivalent published artifact.
+replaces:
+  # Paths are resolved relative to the generated `_build/go.mod`, i.e.
+  # `<repo-root>/otel-collector/_build/go.mod`. Two `..` hops to climb
+  # back to the repo root.
+  - github.com/opendata-oss/opendata-go/exporter/opendataexporter => ../../exporter/opendataexporter
+  - github.com/opendata-oss/opendata-go => ../..

@@ -94,7 +94,12 @@ type batchAccumulator struct {
 	started   bool
 }
 
-func (b *batchAccumulator) add(msg *appendMessage) {
+// add appends `msg` to the accumulator. Returns `becameStarted == true`
+// on the empty → non-empty transition so the rotator can publish the
+// `oldestUnflushed` clock that the Phase 8 perf rig's
+// `producer_oldest_unflushed_batch_age_seconds` gauge surfaces.
+func (b *batchAccumulator) add(msg *appendMessage) (becameStarted bool) {
+	wasStarted := b.started
 	startIndex := uint32(len(b.entries))
 	b.entries = append(b.entries, msg.entries...)
 	b.metadata = append(b.metadata, QueueMetadata{
@@ -114,6 +119,7 @@ func (b *batchAccumulator) add(msg *appendMessage) {
 		b.startedAt = time.Now()
 		b.started = true
 	}
+	return !wasStarted && b.started
 }
 
 func (b *batchAccumulator) isEmpty() bool {
@@ -267,6 +273,15 @@ type Producer struct {
 	// Phase 3.7 metrics state (atomic counters for `workers_busy`).
 	encodeWorkersBusy atomic.Int64
 	uploadWorkersBusy atomic.Int64
+
+	// Wall-clock UnixNano timestamp of the oldest message in the
+	// rotator's current `batchAccumulator`. Zero means the accumulator
+	// is empty. Written by the rotator goroutine on the empty →
+	// non-empty transition (and back to zero on reset) and read by
+	// `OldestUnflushedBatchAge` from external metric scrapers. Surfaces
+	// as `producer_oldest_unflushed_batch_age_seconds` for the Phase 8
+	// cell-bench bottleneck classifier.
+	oldestUnflushedNs atomic.Int64
 
 	// halted marks the producer as terminally failed (manifest CAS
 	// retry budget exhausted on a non-CAS-conflict error). Once set,
@@ -461,6 +476,7 @@ func (p *Producer) rotator() {
 			p.budget.release(batch.byteCost, 0)
 			p.emitInflightSnapshot()
 			_, _, watchers, _ := batch.reset()
+			p.oldestUnflushedNs.Store(0)
 			for _, dw := range watchers {
 				dw.resolve(ErrShutdown)
 			}
@@ -476,6 +492,7 @@ func (p *Producer) rotator() {
 		p.emitInflightSnapshot()
 		stats := batch.stats()
 		entries, metadata, watchers, byteCost := batch.reset()
+		p.oldestUnflushedNs.Store(0)
 		// Reconcile the per-message byte reservation to the
 		// accumulator's actual framed byte cost: per-entry length
 		// prefix (batchEntryLenSize bytes per entry) + per-batch
@@ -545,7 +562,9 @@ func (p *Producer) rotator() {
 				emit(FlushReasonShutdown, nil)
 				return
 			}
-			batch.add(msg)
+			if becameStarted := batch.add(msg); becameStarted {
+				p.oldestUnflushedNs.Store(batch.startedAt.UnixNano())
+			}
 			if batch.sizeBytes >= p.config.FlushSizeBytes {
 				emit(FlushReasonSize, nil)
 			}
@@ -554,6 +573,12 @@ func (p *Producer) rotator() {
 			// before emitting, so the flush captures everything
 			// submitted before this Flush call.
 			drainAppendChInto(p.appendCh, batch)
+			if batch.started {
+				// drainAppendChInto may have transitioned the
+				// accumulator empty→non-empty; refresh the atomic
+				// without clobbering an older timestamp.
+				p.oldestUnflushedNs.CompareAndSwap(0, batch.startedAt.UnixNano())
+			}
 			emit(FlushReasonManual, fm.result)
 		case <-timerCh:
 			emit(FlushReasonTime, nil)
@@ -1281,6 +1306,33 @@ func (p *Producer) Flush(ctx context.Context) error {
 // ConflictRate returns the percentage of manifest writes that encountered a conflict.
 func (p *Producer) ConflictRate() float64 {
 	return p.enqueuer.conflictRate()
+}
+
+// OldestUnflushedBatchAge returns the wall-clock age of the oldest
+// record currently sitting in the rotator's active batch accumulator.
+// Returns zero when the accumulator is empty (no records pending
+// flush). External metric scrapers — the Phase 8 OTel collector that
+// embeds this producer publishes this as the Prometheus gauge
+// `producer_oldest_unflushed_batch_age_seconds` for the cell-bench
+// bottleneck classifier (see phase08-realworld-clickhouse-cell-design
+// §Lag Accounting).
+//
+// "Unflushed" means "still in the rotator's accumulator." Once the
+// rotator emits the batch downstream (to the encoder pool), this gauge
+// drops to zero even though the batch has not yet reached the manifest.
+// Detecting pipeline-stage stalls beyond the rotator is row 8.4 work;
+// the v0 metric is sufficient for catching the "rotator is wedged on
+// appendCh while records pile up" classifier signal.
+func (p *Producer) OldestUnflushedBatchAge() time.Duration {
+	ns := p.oldestUnflushedNs.Load()
+	if ns == 0 {
+		return 0
+	}
+	age := time.Since(time.Unix(0, ns))
+	if age < 0 {
+		return 0
+	}
+	return age
 }
 
 // Close flushes any remaining buffered entries and shuts down the producer.
