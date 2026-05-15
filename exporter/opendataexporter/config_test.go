@@ -12,11 +12,12 @@ func TestConfigValidate(t *testing.T) {
 			Bucket: "metrics-bucket",
 			Region: "us-west-2",
 		},
-		DataPathPrefix: "ingest/otel/metrics/data",
-		ManifestPath:   "ingest/otel/metrics/manifest",
-		FlushInterval:  10 * time.Second,
-		FlushSizeBytes: 1024,
-		Compression:    compressionZstd,
+		DataPathPrefix:    "ingest/otel/metrics/data",
+		ManifestPath:      "ingest/otel/metrics/manifest",
+		FlushInterval:     10 * time.Second,
+		FlushSizeBytes:    1024,
+		Compression:       compressionZstd,
+		UploadConcurrency: 1,
 	}
 
 	tests := []struct {
@@ -87,6 +88,26 @@ func TestConfigValidate(t *testing.T) {
 				cfg.Compression = "gzip"
 			},
 			wantErr: true,
+		},
+		{
+			name: "upload_concurrency zero",
+			mutate: func(cfg *Config) {
+				cfg.UploadConcurrency = 0
+			},
+			wantErr: true,
+		},
+		{
+			name: "upload_concurrency negative",
+			mutate: func(cfg *Config) {
+				cfg.UploadConcurrency = -1
+			},
+			wantErr: true,
+		},
+		{
+			name: "upload_concurrency four",
+			mutate: func(cfg *Config) {
+				cfg.UploadConcurrency = 4
+			},
 		},
 		{
 			name: "none compression",

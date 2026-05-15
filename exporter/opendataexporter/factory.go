@@ -7,6 +7,8 @@ import (
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/exporter"
 	"go.uber.org/zap"
+
+	"github.com/opendata-oss/opendata-go/buffer"
 )
 
 // Default object-store path layout for the metrics signal. Used both as the
@@ -44,9 +46,10 @@ func createDefaultConfig() component.Config {
 		},
 		DataPathPrefix: defaultMetricsDataPathPrefix,
 		ManifestPath:   defaultMetricsManifestPath,
-		FlushInterval:  10 * time.Second,
-		FlushSizeBytes: defaultFlushSizeMiB,
-		Compression:    compressionZstd,
+		FlushInterval:     10 * time.Second,
+		FlushSizeBytes:    defaultFlushSizeMiB,
+		Compression:       compressionZstd,
+		UploadConcurrency: buffer.DefaultUploadConcurrency,
 	}
 }
 

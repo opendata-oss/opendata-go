@@ -44,6 +44,9 @@ func TestCreateDefaultConfig(t *testing.T) {
 	if cfg.Compression != compressionZstd {
 		t.Fatalf("unexpected compression: %q", cfg.Compression)
 	}
+	if cfg.UploadConcurrency < 1 {
+		t.Fatalf("default upload_concurrency must be at least 1, got %d", cfg.UploadConcurrency)
+	}
 }
 
 func TestCreateMetricsExporter(t *testing.T) {

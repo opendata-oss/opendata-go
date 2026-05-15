@@ -29,6 +29,11 @@ type Config struct {
 	FlushInterval  time.Duration     `mapstructure:"flush_interval"`
 	FlushSizeBytes int               `mapstructure:"flush_size_bytes"`
 	Compression    string            `mapstructure:"compression"`
+
+	// UploadConcurrency caps the number of object_store upload workers
+	// running in parallel. Forwarded to `buffer.ProducerConfig.UploadConcurrency`
+	// at Start; the producer default is 1 (serial upload).
+	UploadConcurrency int `mapstructure:"upload_concurrency"`
 }
 
 // Validate checks whether the exporter configuration is usable.
@@ -60,6 +65,9 @@ func (c *Config) Validate() error {
 	}
 	if c.FlushSizeBytes <= 0 {
 		return fmt.Errorf("flush_size_bytes must be greater than zero")
+	}
+	if c.UploadConcurrency < 1 {
+		return fmt.Errorf("upload_concurrency must be at least 1 (got %d)", c.UploadConcurrency)
 	}
 
 	switch strings.ToLower(c.Compression) {

@@ -99,6 +99,7 @@ func (e *openDataExporter) Start(ctx context.Context, _ component.Host) error {
 	producerConfig.ManifestPath = e.config.ManifestPath
 	producerConfig.FlushInterval = e.config.FlushInterval
 	producerConfig.FlushSizeBytes = e.config.FlushSizeBytes
+	producerConfig.UploadConcurrency = e.config.UploadConcurrency
 	producerConfig.BatchCompression = compression
 	producerConfig.Observer = e.telemetry
 
@@ -107,16 +108,14 @@ func (e *openDataExporter) Start(ctx context.Context, _ component.Host) error {
 	// `buffer.producer.oldest_unflushed_batch_age_seconds` starts
 	// reporting non-zero values on the next OTel collection cycle.
 	e.telemetry.setProducer(e.producer)
+	// Dump the full effective Config (after factory defaults + user
+	// YAML merge) so operators can verify what's actually running.
+	// Phase 8 row 8.4 tuning iterations depend on this — a partial
+	// log set previously hid a class of silently-dropped knobs.
 	e.telemetry.logger.Info(
 		"Starting OpenData exporter",
 		zap.String("signal", signalLabel(e.signalType)),
-		zap.String("bucket", e.config.ObjectStore.Bucket),
-		zap.String("region", e.config.ObjectStore.Region),
-		zap.String("data_path_prefix", e.config.DataPathPrefix),
-		zap.String("manifest_path", e.config.ManifestPath),
-		zap.Duration("flush_interval", e.config.FlushInterval),
-		zap.Int("flush_size_bytes", e.config.FlushSizeBytes),
-		zap.String("compression", e.config.Compression),
+		zap.Any("config", e.config),
 	)
 	return nil
 }
