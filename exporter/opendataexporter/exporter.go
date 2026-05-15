@@ -159,10 +159,18 @@ func (e *openDataExporter) ConsumeMetrics(ctx context.Context, md pmetric.Metric
 		e.telemetry.recordFailure(ctx, "marshal", err)
 		return err
 	}
-	e.telemetry.recordMarshal(ctx, len(buf), time.Since(marshalStart))
+	bufLen := len(buf)
+	e.telemetry.recordMarshal(ctx, bufLen, time.Since(marshalStart))
 
 	err = e.appendAndAwait(ctx, buf)
-	e.telemetry.recordDurableWaitMetrics(ctx, time.Since(start), err, metricCount, dataPointCount, len(buf))
+	// `appendAndAwait` blocks until durable. The producer has its own
+	// reference to the underlying byte slice for the duration of the
+	// pipeline; dropping our reference here lets GC reclaim the
+	// marshaled bytes as soon as the producer's encoder finishes
+	// (Phase 1 #1 memory fix; see plans/odb-high-throughput/
+	// next-session.md). `len(buf)` is captured above for telemetry.
+	buf = nil
+	e.telemetry.recordDurableWaitMetrics(ctx, time.Since(start), err, metricCount, dataPointCount, bufLen)
 	return err
 }
 
@@ -181,10 +189,12 @@ func (e *openDataExporter) ConsumeLogs(ctx context.Context, ld plog.Logs) error 
 		e.telemetry.recordFailure(ctx, "marshal", err)
 		return err
 	}
-	e.telemetry.recordMarshal(ctx, len(buf), time.Since(marshalStart))
+	bufLen := len(buf)
+	e.telemetry.recordMarshal(ctx, bufLen, time.Since(marshalStart))
 
 	err = e.appendAndAwait(ctx, buf)
-	e.telemetry.recordDurableWaitLogs(ctx, time.Since(start), err, logRecordCount, len(buf))
+	buf = nil // see ConsumeMetrics; Phase 1 #1 memory fix.
+	e.telemetry.recordDurableWaitLogs(ctx, time.Since(start), err, logRecordCount, bufLen)
 	return err
 }
 
@@ -202,6 +212,12 @@ func (e *openDataExporter) appendAndAwait(ctx context.Context, payload []byte) e
 
 	enqueueStart := time.Now()
 	handle, err := producer.Append([][]byte{payload}, e.metadata)
+	// `producer.Append` copies the slice header into the pending
+	// batch. Drop our reference so this goroutine isn't the one
+	// pinning the marshaled bytes through the durable wait — the
+	// producer's own retention is the one we control elsewhere
+	// (Phase 1 #2/#3 fixes in buffer/producer.go).
+	payload = nil
 	e.telemetry.recordEnqueueWait(ctx, time.Since(enqueueStart))
 	if err != nil {
 		e.telemetry.recordFailure(ctx, "enqueue", err)

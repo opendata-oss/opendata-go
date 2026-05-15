@@ -652,6 +652,17 @@ func (p *Producer) encoder() {
 			encodeFn = p.encodeFn
 		}
 		payload, err := encodeFn(pb.entries, p.config.BatchCompression)
+		// EncodeBatch has produced the wire-format `payload`. The
+		// original marshaled `pb.entries` (a [][]byte of OTLP
+		// payloads, one slice per ConsumeLogs / ConsumeMetrics
+		// request) are no longer referenced by the pipeline. Dropping
+		// them here lets GC reclaim the bytes as soon as the
+		// exporter side also released its reference (see
+		// exporter/opendataexporter/exporter.go appendAndAwait).
+		// Without this, a 64-batch in-flight window pins ~64 ×
+		// per-batch marshaled bytes (~512 MiB at row 8.4 sizes).
+		// Phase 1 #2 memory fix.
+		pb.entries = nil
 		busy = p.encodeWorkersBusy.Add(-1)
 		if p.config.Observer != nil {
 			p.config.Observer.OnEncodeDuration(time.Since(encodeStart), err)
@@ -769,6 +780,15 @@ func (p *Producer) uploaderWorker() {
 		if p.config.Observer != nil {
 			p.config.Observer.OnWorkersBusy(StageUpload, int(busy))
 		}
+		// The upload's bytes are now durable in object storage. The
+		// downstream ManifestCommitter and WatcherResolver only need
+		// `location`, `metadata`, `watchers`, `stats`, and the
+		// terminal outcome — not the encoded payload itself. Dropping
+		// the reference here lets GC reclaim ~per-batch-size bytes
+		// per in-flight slot (~6 MiB × MaxInFlightBatches at row 8.4
+		// sizes, ≈ 384 MiB peak). Size and location are already
+		// captured in the encodedBatch fields. Phase 1 #3 memory fix.
+		eb.payload = nil
 		// Always signal the committer — even on PUT failure — so
 		// the committer can resolve the batch's watchers and skip
 		// the ordinal in the manifest sequence.
