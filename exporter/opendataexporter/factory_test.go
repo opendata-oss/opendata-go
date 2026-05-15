@@ -57,6 +57,9 @@ func TestCreateDefaultConfig(t *testing.T) {
 	if cfg.MaxInFlightBytes < 1 {
 		t.Fatalf("default max_inflight_bytes must be at least 1, got %d", cfg.MaxInFlightBytes)
 	}
+	if cfg.ManifestAppendBatchSize < 1 {
+		t.Fatalf("default manifest_append_batch_size must be at least 1, got %d", cfg.ManifestAppendBatchSize)
+	}
 }
 
 func TestCreateMetricsExporter(t *testing.T) {

@@ -58,6 +58,17 @@ type Config struct {
 	// memory budget and the network bandwidth-delay product.
 	MaxInFlightBytes int `mapstructure:"max_inflight_bytes"`
 
+	// ManifestAppendBatchSize is the maximum number of ready
+	// ordinals the ManifestCommitter coalesces into a single
+	// PutIfMatch call. Forwarded to
+	// `buffer.ProducerConfig.ManifestAppendBatchSize`. Producer
+	// default is 1 (one batch per CAS, pre-Phase-3 behavior); 16
+	// is the post-sweep production guess. Coalescing trades a
+	// small batch-level latency increase for ~N× lower per-batch
+	// manifest CAS cost — the dominant chunk of durable_wait
+	// when upload concurrency is healthy.
+	ManifestAppendBatchSize int `mapstructure:"manifest_append_batch_size"`
+
 	// SendingQueue wraps the exporter's ConsumeLogs/Metrics with the
 	// standard OTel exporterhelper queue. Decouples the receiver's
 	// HTTP response from the producer's AwaitDurable wait — the
@@ -111,6 +122,9 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxInFlightBytes < 1 {
 		return fmt.Errorf("max_inflight_bytes must be at least 1 (got %d)", c.MaxInFlightBytes)
+	}
+	if c.ManifestAppendBatchSize < 1 {
+		return fmt.Errorf("manifest_append_batch_size must be at least 1 (got %d)", c.ManifestAppendBatchSize)
 	}
 	if c.SendingQueue.HasValue() {
 		if err := c.SendingQueue.Get().Validate(); err != nil {

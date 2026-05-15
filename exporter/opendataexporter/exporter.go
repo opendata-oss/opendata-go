@@ -103,6 +103,7 @@ func (e *openDataExporter) Start(ctx context.Context, _ component.Host) error {
 	producerConfig.EncodeConcurrency = e.config.EncodeConcurrency
 	producerConfig.MaxInFlightBatches = e.config.MaxInFlightBatches
 	producerConfig.MaxInFlightBytes = e.config.MaxInFlightBytes
+	producerConfig.ManifestAppendBatchSize = e.config.ManifestAppendBatchSize
 	producerConfig.BatchCompression = compression
 	producerConfig.Observer = e.telemetry
 

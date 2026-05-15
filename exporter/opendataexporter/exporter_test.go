@@ -27,10 +27,11 @@ func TestOpenDataExporterConsumeMetricsRoundTrip(t *testing.T) {
 		FlushInterval:      24 * time.Hour,
 		FlushSizeBytes:     1,
 		Compression:        compressionNone,
-		UploadConcurrency:  1,
-		EncodeConcurrency:  1,
-		MaxInFlightBatches: 64,
-		MaxInFlightBytes:   256 * 1024 * 1024,
+		UploadConcurrency:       1,
+		EncodeConcurrency:       1,
+		MaxInFlightBatches:      64,
+		MaxInFlightBytes:        256 * 1024 * 1024,
+		ManifestAppendBatchSize: 1,
 	}
 
 	exp := newOpenDataExporter(cfg)
@@ -147,10 +148,11 @@ func TestOpenDataExporterConsumeLogsRoundTrip(t *testing.T) {
 		FlushInterval:      24 * time.Hour,
 		FlushSizeBytes:     1,
 		Compression:        compressionNone,
-		UploadConcurrency:  1,
-		EncodeConcurrency:  1,
-		MaxInFlightBatches: 64,
-		MaxInFlightBytes:   256 * 1024 * 1024,
+		UploadConcurrency:       1,
+		EncodeConcurrency:       1,
+		MaxInFlightBatches:      64,
+		MaxInFlightBytes:        256 * 1024 * 1024,
+		ManifestAppendBatchSize: 1,
 	}
 
 	exp := newOpenDataExporterForSignal(cfg, SignalTypeLogs)
@@ -277,10 +279,11 @@ func TestMetricsAndLogsExportersDoNotCrossContaminate(t *testing.T) {
 		FlushInterval:      24 * time.Hour,
 		FlushSizeBytes:     1,
 		Compression:        compressionNone,
-		UploadConcurrency:  1,
-		EncodeConcurrency:  1,
-		MaxInFlightBatches: 64,
-		MaxInFlightBytes:   256 * 1024 * 1024,
+		UploadConcurrency:       1,
+		EncodeConcurrency:       1,
+		MaxInFlightBatches:      64,
+		MaxInFlightBytes:        256 * 1024 * 1024,
+		ManifestAppendBatchSize: 1,
 	}
 	logsCfg := &Config{
 		ObjectStore: ObjectStoreConfig{
@@ -293,10 +296,11 @@ func TestMetricsAndLogsExportersDoNotCrossContaminate(t *testing.T) {
 		FlushInterval:      24 * time.Hour,
 		FlushSizeBytes:     1,
 		Compression:        compressionNone,
-		UploadConcurrency:  1,
-		EncodeConcurrency:  1,
-		MaxInFlightBatches: 64,
-		MaxInFlightBytes:   256 * 1024 * 1024,
+		UploadConcurrency:       1,
+		EncodeConcurrency:       1,
+		MaxInFlightBatches:      64,
+		MaxInFlightBytes:        256 * 1024 * 1024,
+		ManifestAppendBatchSize: 1,
 	}
 
 	metricsExp := newOpenDataExporterForSignal(metricsCfg, SignalTypeMetrics)

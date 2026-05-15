@@ -51,10 +51,11 @@ func createDefaultConfig() component.Config {
 		FlushInterval:      10 * time.Second,
 		FlushSizeBytes:     defaultFlushSizeMiB,
 		Compression:        compressionZstd,
-		UploadConcurrency:  buffer.DefaultUploadConcurrency,
-		EncodeConcurrency:  buffer.DefaultEncodeConcurrency,
-		MaxInFlightBatches: buffer.DefaultMaxInFlightBatches,
-		MaxInFlightBytes:   buffer.DefaultMaxInFlightBytes,
+		UploadConcurrency:       buffer.DefaultUploadConcurrency,
+		EncodeConcurrency:       buffer.DefaultEncodeConcurrency,
+		MaxInFlightBatches:      buffer.DefaultMaxInFlightBatches,
+		MaxInFlightBytes:        buffer.DefaultMaxInFlightBytes,
+		ManifestAppendBatchSize: buffer.DefaultManifestAppendBatchSize,
 		// Default the sending_queue to the exporterhelper standard
 		// (NumConsumers=10, QueueSize=1000, non-blocking). Without
 		// the queue, every OTel pipeline call into ConsumeLogs

@@ -17,10 +17,11 @@ func TestConfigValidate(t *testing.T) {
 		FlushInterval:      10 * time.Second,
 		FlushSizeBytes:     1024,
 		Compression:        compressionZstd,
-		UploadConcurrency:  1,
-		EncodeConcurrency:  1,
-		MaxInFlightBatches: 64,
-		MaxInFlightBytes:   256 * 1024 * 1024,
+		UploadConcurrency:       1,
+		EncodeConcurrency:       1,
+		MaxInFlightBatches:      64,
+		MaxInFlightBytes:        256 * 1024 * 1024,
+		ManifestAppendBatchSize: 1,
 	}
 
 	tests := []struct {
@@ -143,6 +144,26 @@ func TestConfigValidate(t *testing.T) {
 			name: "max_inflight_bytes one gib",
 			mutate: func(cfg *Config) {
 				cfg.MaxInFlightBytes = 1024 * 1024 * 1024
+			},
+		},
+		{
+			name: "manifest_append_batch_size zero",
+			mutate: func(cfg *Config) {
+				cfg.ManifestAppendBatchSize = 0
+			},
+			wantErr: true,
+		},
+		{
+			name: "manifest_append_batch_size negative",
+			mutate: func(cfg *Config) {
+				cfg.ManifestAppendBatchSize = -1
+			},
+			wantErr: true,
+		},
+		{
+			name: "manifest_append_batch_size sixteen (production guess)",
+			mutate: func(cfg *Config) {
+				cfg.ManifestAppendBatchSize = 16
 			},
 		},
 		{
