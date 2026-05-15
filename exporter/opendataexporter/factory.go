@@ -46,10 +46,13 @@ func createDefaultConfig() component.Config {
 		},
 		DataPathPrefix: defaultMetricsDataPathPrefix,
 		ManifestPath:   defaultMetricsManifestPath,
-		FlushInterval:     10 * time.Second,
-		FlushSizeBytes:    defaultFlushSizeMiB,
-		Compression:       compressionZstd,
-		UploadConcurrency: buffer.DefaultUploadConcurrency,
+		FlushInterval:      10 * time.Second,
+		FlushSizeBytes:     defaultFlushSizeMiB,
+		Compression:        compressionZstd,
+		UploadConcurrency:  buffer.DefaultUploadConcurrency,
+		EncodeConcurrency:  buffer.DefaultEncodeConcurrency,
+		MaxInFlightBatches: buffer.DefaultMaxInFlightBatches,
+		MaxInFlightBytes:   buffer.DefaultMaxInFlightBytes,
 	}
 }
 

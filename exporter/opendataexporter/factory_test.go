@@ -47,6 +47,15 @@ func TestCreateDefaultConfig(t *testing.T) {
 	if cfg.UploadConcurrency < 1 {
 		t.Fatalf("default upload_concurrency must be at least 1, got %d", cfg.UploadConcurrency)
 	}
+	if cfg.EncodeConcurrency < 1 {
+		t.Fatalf("default encode_concurrency must be at least 1, got %d", cfg.EncodeConcurrency)
+	}
+	if cfg.MaxInFlightBatches < 1 {
+		t.Fatalf("default max_inflight_batches must be at least 1, got %d", cfg.MaxInFlightBatches)
+	}
+	if cfg.MaxInFlightBytes < 1 {
+		t.Fatalf("default max_inflight_bytes must be at least 1, got %d", cfg.MaxInFlightBytes)
+	}
 }
 
 func TestCreateMetricsExporter(t *testing.T) {

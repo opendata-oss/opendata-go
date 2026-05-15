@@ -24,10 +24,13 @@ func TestOpenDataExporterConsumeMetricsRoundTrip(t *testing.T) {
 		},
 		DataPathPrefix: "ingest/otel/metrics/data",
 		ManifestPath:   "ingest/otel/metrics/manifest",
-		FlushInterval:     24 * time.Hour,
-		FlushSizeBytes:    1,
-		Compression:       compressionNone,
-		UploadConcurrency: 1,
+		FlushInterval:      24 * time.Hour,
+		FlushSizeBytes:     1,
+		Compression:        compressionNone,
+		UploadConcurrency:  1,
+		EncodeConcurrency:  1,
+		MaxInFlightBatches: 64,
+		MaxInFlightBytes:   256 * 1024 * 1024,
 	}
 
 	exp := newOpenDataExporter(cfg)
@@ -141,10 +144,13 @@ func TestOpenDataExporterConsumeLogsRoundTrip(t *testing.T) {
 		},
 		DataPathPrefix: "ingest/otel/logs/data",
 		ManifestPath:   "ingest/otel/logs/manifest",
-		FlushInterval:     24 * time.Hour,
-		FlushSizeBytes:    1,
-		Compression:       compressionNone,
-		UploadConcurrency: 1,
+		FlushInterval:      24 * time.Hour,
+		FlushSizeBytes:     1,
+		Compression:        compressionNone,
+		UploadConcurrency:  1,
+		EncodeConcurrency:  1,
+		MaxInFlightBatches: 64,
+		MaxInFlightBytes:   256 * 1024 * 1024,
 	}
 
 	exp := newOpenDataExporterForSignal(cfg, SignalTypeLogs)
@@ -268,10 +274,13 @@ func TestMetricsAndLogsExportersDoNotCrossContaminate(t *testing.T) {
 		},
 		DataPathPrefix: "ingest/otel/metrics/data",
 		ManifestPath:   "ingest/otel/metrics/manifest",
-		FlushInterval:     24 * time.Hour,
-		FlushSizeBytes:    1,
-		Compression:       compressionNone,
-		UploadConcurrency: 1,
+		FlushInterval:      24 * time.Hour,
+		FlushSizeBytes:     1,
+		Compression:        compressionNone,
+		UploadConcurrency:  1,
+		EncodeConcurrency:  1,
+		MaxInFlightBatches: 64,
+		MaxInFlightBytes:   256 * 1024 * 1024,
 	}
 	logsCfg := &Config{
 		ObjectStore: ObjectStoreConfig{
@@ -281,10 +290,13 @@ func TestMetricsAndLogsExportersDoNotCrossContaminate(t *testing.T) {
 		},
 		DataPathPrefix: "ingest/otel/logs/data",
 		ManifestPath:   "ingest/otel/logs/manifest",
-		FlushInterval:     24 * time.Hour,
-		FlushSizeBytes:    1,
-		Compression:       compressionNone,
-		UploadConcurrency: 1,
+		FlushInterval:      24 * time.Hour,
+		FlushSizeBytes:     1,
+		Compression:        compressionNone,
+		UploadConcurrency:  1,
+		EncodeConcurrency:  1,
+		MaxInFlightBatches: 64,
+		MaxInFlightBytes:   256 * 1024 * 1024,
 	}
 
 	metricsExp := newOpenDataExporterForSignal(metricsCfg, SignalTypeMetrics)

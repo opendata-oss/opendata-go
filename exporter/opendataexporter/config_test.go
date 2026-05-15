@@ -12,12 +12,15 @@ func TestConfigValidate(t *testing.T) {
 			Bucket: "metrics-bucket",
 			Region: "us-west-2",
 		},
-		DataPathPrefix:    "ingest/otel/metrics/data",
-		ManifestPath:      "ingest/otel/metrics/manifest",
-		FlushInterval:     10 * time.Second,
-		FlushSizeBytes:    1024,
-		Compression:       compressionZstd,
-		UploadConcurrency: 1,
+		DataPathPrefix:     "ingest/otel/metrics/data",
+		ManifestPath:       "ingest/otel/metrics/manifest",
+		FlushInterval:      10 * time.Second,
+		FlushSizeBytes:     1024,
+		Compression:        compressionZstd,
+		UploadConcurrency:  1,
+		EncodeConcurrency:  1,
+		MaxInFlightBatches: 64,
+		MaxInFlightBytes:   256 * 1024 * 1024,
 	}
 
 	tests := []struct {
@@ -107,6 +110,39 @@ func TestConfigValidate(t *testing.T) {
 			name: "upload_concurrency four",
 			mutate: func(cfg *Config) {
 				cfg.UploadConcurrency = 4
+			},
+		},
+		{
+			name: "encode_concurrency zero",
+			mutate: func(cfg *Config) {
+				cfg.EncodeConcurrency = 0
+			},
+			wantErr: true,
+		},
+		{
+			name: "encode_concurrency four (cpu-limit calibration)",
+			mutate: func(cfg *Config) {
+				cfg.EncodeConcurrency = 4
+			},
+		},
+		{
+			name: "max_inflight_batches zero",
+			mutate: func(cfg *Config) {
+				cfg.MaxInFlightBatches = 0
+			},
+			wantErr: true,
+		},
+		{
+			name: "max_inflight_bytes zero",
+			mutate: func(cfg *Config) {
+				cfg.MaxInFlightBytes = 0
+			},
+			wantErr: true,
+		},
+		{
+			name: "max_inflight_bytes one gib",
+			mutate: func(cfg *Config) {
+				cfg.MaxInFlightBytes = 1024 * 1024 * 1024
 			},
 		},
 		{

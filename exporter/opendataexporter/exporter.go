@@ -100,6 +100,9 @@ func (e *openDataExporter) Start(ctx context.Context, _ component.Host) error {
 	producerConfig.FlushInterval = e.config.FlushInterval
 	producerConfig.FlushSizeBytes = e.config.FlushSizeBytes
 	producerConfig.UploadConcurrency = e.config.UploadConcurrency
+	producerConfig.EncodeConcurrency = e.config.EncodeConcurrency
+	producerConfig.MaxInFlightBatches = e.config.MaxInFlightBatches
+	producerConfig.MaxInFlightBytes = e.config.MaxInFlightBytes
 	producerConfig.BatchCompression = compression
 	producerConfig.Observer = e.telemetry
 
