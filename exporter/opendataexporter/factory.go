@@ -5,7 +5,9 @@ import (
 	"time"
 
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/config/configoptional"
 	"go.opentelemetry.io/collector/exporter"
+	"go.opentelemetry.io/collector/exporter/exporterhelper"
 	"go.uber.org/zap"
 
 	"github.com/opendata-oss/opendata-go/buffer"
@@ -53,17 +55,34 @@ func createDefaultConfig() component.Config {
 		EncodeConcurrency:  buffer.DefaultEncodeConcurrency,
 		MaxInFlightBatches: buffer.DefaultMaxInFlightBatches,
 		MaxInFlightBytes:   buffer.DefaultMaxInFlightBytes,
+		// Default the sending_queue to the exporterhelper standard
+		// (NumConsumers=10, QueueSize=1000, non-blocking). Without
+		// the queue, every OTel pipeline call into ConsumeLogs
+		// blocks on AwaitDurable, which serializes the receiver
+		// against the producer's batch flush cadence.
+		SendingQueue: configoptional.Some(exporterhelper.NewDefaultQueueConfig()),
 	}
 }
 
-func createMetricsExporter(_ context.Context, set exporter.Settings, cfg component.Config) (exporter.Metrics, error) {
-	return newOpenDataExporterForSignalWithTelemetry(cfg.(*Config), SignalTypeMetrics, componentTelemetrySettings{
+func createMetricsExporter(ctx context.Context, set exporter.Settings, cfg component.Config) (exporter.Metrics, error) {
+	c := cfg.(*Config)
+	inner, err := newOpenDataExporterForSignalWithTelemetry(c, SignalTypeMetrics, componentTelemetrySettings{
 		logger:        set.Logger,
 		meterProvider: set.MeterProvider,
 	})
+	if err != nil {
+		return nil, err
+	}
+	return exporterhelper.NewMetrics(
+		ctx, set, c, inner.ConsumeMetrics,
+		exporterhelper.WithStart(inner.Start),
+		exporterhelper.WithShutdown(inner.Shutdown),
+		exporterhelper.WithCapabilities(inner.Capabilities()),
+		exporterhelper.WithQueue(c.SendingQueue),
+	)
 }
 
-func createLogsExporter(_ context.Context, set exporter.Settings, cfg component.Config) (exporter.Logs, error) {
+func createLogsExporter(ctx context.Context, set exporter.Settings, cfg component.Config) (exporter.Logs, error) {
 	// Copy the config before mutating. The OTel Collector framework may pass
 	// the same *Config instance into both createMetricsExporter and
 	// createLogsExporter when a single named exporter is wired into multiple
@@ -71,10 +90,20 @@ func createLogsExporter(_ context.Context, set exporter.Settings, cfg component.
 	// after a logs exporter would inherit the logs-flavored paths.
 	local := *(cfg.(*Config))
 	applyLogsPathDefaults(&local, set.Logger)
-	return newOpenDataExporterForSignalWithTelemetry(&local, SignalTypeLogs, componentTelemetrySettings{
+	inner, err := newOpenDataExporterForSignalWithTelemetry(&local, SignalTypeLogs, componentTelemetrySettings{
 		logger:        set.Logger,
 		meterProvider: set.MeterProvider,
 	})
+	if err != nil {
+		return nil, err
+	}
+	return exporterhelper.NewLogs(
+		ctx, set, &local, inner.ConsumeLogs,
+		exporterhelper.WithStart(inner.Start),
+		exporterhelper.WithShutdown(inner.Shutdown),
+		exporterhelper.WithCapabilities(inner.Capabilities()),
+		exporterhelper.WithQueue(local.SendingQueue),
+	)
 }
 
 // applyLogsPathDefaults swaps the metrics-flavored default DataPathPrefix and

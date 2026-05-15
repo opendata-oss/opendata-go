@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/exporter"
 )
 
@@ -63,7 +64,8 @@ func TestCreateMetricsExporter(t *testing.T) {
 	cfg := createDefaultConfig()
 
 	exp, err := f.CreateMetrics(context.Background(), exporter.Settings{
-		ID: component.NewID(componentType),
+		ID:                component.NewID(componentType),
+		TelemetrySettings: componenttest.NewNopTelemetrySettings(),
 	}, cfg)
 	if err != nil {
 		t.Fatalf("CreateMetrics returned error: %v", err)
@@ -78,7 +80,8 @@ func TestCreateLogsExporter(t *testing.T) {
 	cfg := createDefaultConfig()
 
 	exp, err := f.CreateLogs(context.Background(), exporter.Settings{
-		ID: component.NewID(componentType),
+		ID:                component.NewID(componentType),
+		TelemetrySettings: componenttest.NewNopTelemetrySettings(),
 	}, cfg)
 	if err != nil {
 		t.Fatalf("CreateLogs returned error: %v", err)
@@ -137,7 +140,8 @@ func TestCreateLogsExporterDoesNotMutateInputConfig(t *testing.T) {
 	originalManifest := cfg.(*Config).ManifestPath
 
 	if _, err := f.CreateLogs(context.Background(), exporter.Settings{
-		ID: component.NewID(componentType),
+		ID:                component.NewID(componentType),
+		TelemetrySettings: componenttest.NewNopTelemetrySettings(),
 	}, cfg); err != nil {
 		t.Fatalf("CreateLogs returned error: %v", err)
 	}

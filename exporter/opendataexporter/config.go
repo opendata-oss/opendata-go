@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"go.opentelemetry.io/collector/config/configoptional"
+	"go.opentelemetry.io/collector/exporter/exporterhelper"
 )
 
 const (
@@ -54,6 +57,17 @@ type Config struct {
 	// Producer default is 256 MiB. Size against the host pod's
 	// memory budget and the network bandwidth-delay product.
 	MaxInFlightBytes int `mapstructure:"max_inflight_bytes"`
+
+	// SendingQueue wraps the exporter's ConsumeLogs/Metrics with the
+	// standard OTel exporterhelper queue. Decouples the receiver's
+	// HTTP response from the producer's AwaitDurable wait — the
+	// receiver ack happens after the request is queued, not after
+	// the batch is durable. NumConsumers determines how many
+	// concurrent push calls run, which is the dominant lever for
+	// throughput when the per-call producer flush is the bottleneck.
+	// Default (NewDefaultQueueConfig): enabled, NumConsumers=10,
+	// QueueSize=1000, BlockOnOverflow=false.
+	SendingQueue configoptional.Optional[exporterhelper.QueueBatchConfig] `mapstructure:"sending_queue"`
 }
 
 // Validate checks whether the exporter configuration is usable.
@@ -97,6 +111,11 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxInFlightBytes < 1 {
 		return fmt.Errorf("max_inflight_bytes must be at least 1 (got %d)", c.MaxInFlightBytes)
+	}
+	if c.SendingQueue.HasValue() {
+		if err := c.SendingQueue.Get().Validate(); err != nil {
+			return fmt.Errorf("sending_queue: %w", err)
+		}
 	}
 
 	switch strings.ToLower(c.Compression) {
