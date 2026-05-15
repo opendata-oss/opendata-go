@@ -14,6 +14,22 @@ import (
 
 const telemetryScopeName = "github.com/opendata-oss/opendata-go/exporter/opendataexporter"
 
+// Histogram bucket boundaries. The OTel-SDK default buckets
+// (`[0, 5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500, 5000,
+// 7500, 10000]`) saturate the [0,5] bucket for both seconds-scale
+// latencies (manifest CAS ~90 ms, durable wait ~400 ms) and
+// small-integer counts (manifest coalesce 1-40). Quantile estimators
+// then degenerate to `boundary × quantile_fraction`, making p50/p99
+// reads useless. These bucket sets fit the actual distributions
+// observed in row 8.4: sub-millisecond fast paths through several
+// seconds of tail, and integer counts in the 1-128 range.
+var (
+	latencySecondsBuckets = []float64{
+		0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+	}
+	smallIntegerCountBuckets = []float64{1, 2, 4, 8, 16, 32, 64, 128}
+)
+
 type exporterTelemetry struct {
 	logger *zap.Logger
 
@@ -53,12 +69,19 @@ type exporterTelemetry struct {
 	uploadDuration          metric.Float64Histogram
 	manifestAppendBatchSize metric.Int64Histogram
 	manifestAppendDuration  metric.Float64Histogram
-	headOfLineBlockDuration metric.Float64Histogram
-	batchOutcomeTotal       metric.Int64Counter
-	haltedGauge             metric.Int64Gauge
-	inflightBytesGauge      metric.Int64Gauge
-	inflightBatchesGauge    metric.Int64Gauge
-	queueDepthGauge         metric.Int64Gauge
+	// manifestAppendCasRetries records the `conflicts` argument
+	// `OnManifestAppendDuration` previously discarded. The legacy
+	// `opendataexporter.manifest_conflicts_per_write` records the
+	// same value through `OnManifestEnqueue`; both observers fire
+	// from the same CAS site (producer.go ~ line 1010) and stay
+	// wired for dashboard continuity.
+	manifestAppendCasRetries metric.Int64Histogram
+	headOfLineBlockDuration  metric.Float64Histogram
+	batchOutcomeTotal        metric.Int64Counter
+	haltedGauge              metric.Int64Gauge
+	inflightBytesGauge       metric.Int64Gauge
+	inflightBatchesGauge     metric.Int64Gauge
+	queueDepthGauge          metric.Int64Gauge
 
 	// `producer.oldest_unflushed_batch_age_seconds` is an
 	// asynchronous (observable) gauge — its callback fires on every
@@ -141,6 +164,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		"opendataexporter.marshal_duration_seconds",
 		metric.WithUnit("s"),
 		metric.WithDescription("Time spent marshaling OTLP metrics payloads."),
+		metric.WithExplicitBucketBoundaries(latencySecondsBuckets...),
 	)
 	if err != nil {
 		return nil, err
@@ -149,6 +173,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		"opendataexporter.enqueue_wait_duration_seconds",
 		metric.WithUnit("s"),
 		metric.WithDescription("Time spent waiting to hand a payload to the buffer."),
+		metric.WithExplicitBucketBoundaries(latencySecondsBuckets...),
 	)
 	if err != nil {
 		return nil, err
@@ -157,6 +182,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		"opendataexporter.durable_wait_duration_seconds",
 		metric.WithUnit("s"),
 		metric.WithDescription("Time from request receipt until the payload is durably flushed."),
+		metric.WithExplicitBucketBoundaries(latencySecondsBuckets...),
 	)
 	if err != nil {
 		return nil, err
@@ -179,6 +205,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		"opendataexporter.flush_duration_seconds",
 		metric.WithUnit("s"),
 		metric.WithDescription("Time spent writing a batch to storage and enqueueing it in the manifest."),
+		metric.WithExplicitBucketBoundaries(latencySecondsBuckets...),
 	)
 	if err != nil {
 		return nil, err
@@ -208,6 +235,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		"opendataexporter.batch_age_seconds",
 		metric.WithUnit("s"),
 		metric.WithDescription("Age of a batch when it is flushed."),
+		metric.WithExplicitBucketBoundaries(latencySecondsBuckets...),
 	)
 	if err != nil {
 		return nil, err
@@ -216,6 +244,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		"opendataexporter.store_put_duration_seconds",
 		metric.WithUnit("s"),
 		metric.WithDescription("Time spent writing batch objects to object storage."),
+		metric.WithExplicitBucketBoundaries(latencySecondsBuckets...),
 	)
 	if err != nil {
 		return nil, err
@@ -231,6 +260,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		"opendataexporter.manifest_enqueue_duration_seconds",
 		metric.WithUnit("s"),
 		metric.WithDescription("Time spent appending a flushed batch to the queue manifest."),
+		metric.WithExplicitBucketBoundaries(latencySecondsBuckets...),
 	)
 	if err != nil {
 		return nil, err
@@ -245,6 +275,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 	manifestConflictsPerWrite, err := meter.Int64Histogram(
 		"opendataexporter.manifest_conflicts_per_write",
 		metric.WithDescription("Number of optimistic concurrency conflicts encountered by each manifest write."),
+		metric.WithExplicitBucketBoundaries(smallIntegerCountBuckets...),
 	)
 	if err != nil {
 		return nil, err
@@ -254,6 +285,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		"buffer.producer.appendch_block_seconds",
 		metric.WithUnit("s"),
 		metric.WithDescription("Time Append/AppendContext spent blocked on the appendCh send (zero in the common no-backpressure case)."),
+		metric.WithExplicitBucketBoundaries(latencySecondsBuckets...),
 	)
 	if err != nil {
 		return nil, err
@@ -276,6 +308,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		"buffer.producer.encode_duration_seconds",
 		metric.WithUnit("s"),
 		metric.WithDescription("Per-batch encode wall time."),
+		metric.WithExplicitBucketBoundaries(latencySecondsBuckets...),
 	)
 	if err != nil {
 		return nil, err
@@ -284,6 +317,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		"buffer.producer.upload_duration_seconds",
 		metric.WithUnit("s"),
 		metric.WithDescription("Per-batch object-PUT wall time (one sample per attempt)."),
+		metric.WithExplicitBucketBoundaries(latencySecondsBuckets...),
 	)
 	if err != nil {
 		return nil, err
@@ -291,6 +325,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 	manifestAppendBatchSize, err := meter.Int64Histogram(
 		"buffer.producer.manifest_append_batch_size",
 		metric.WithDescription("Ordinals coalesced into a single CAS round trip."),
+		metric.WithExplicitBucketBoundaries(smallIntegerCountBuckets...),
 	)
 	if err != nil {
 		return nil, err
@@ -299,6 +334,15 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		"buffer.producer.manifest_append_duration_seconds",
 		metric.WithUnit("s"),
 		metric.WithDescription("Per-CAS manifest write wall time."),
+		metric.WithExplicitBucketBoundaries(latencySecondsBuckets...),
+	)
+	if err != nil {
+		return nil, err
+	}
+	manifestAppendCasRetries, err := meter.Int64Histogram(
+		"buffer.producer.manifest_append_cas_retries",
+		metric.WithDescription("CAS conflict count per manifest append (0 on first-attempt success)."),
+		metric.WithExplicitBucketBoundaries(smallIntegerCountBuckets...),
 	)
 	if err != nil {
 		return nil, err
@@ -307,6 +351,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		"buffer.producer.head_of_line_block_seconds",
 		metric.WithUnit("s"),
 		metric.WithDescription("Time the manifest committer waited for the next-expected ordinal while later ordinals were already ready."),
+		metric.WithExplicitBucketBoundaries(latencySecondsBuckets...),
 	)
 	if err != nil {
 		return nil, err
@@ -382,6 +427,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		uploadDuration:            uploadDuration,
 		manifestAppendBatchSize:   manifestAppendBatchSize,
 		manifestAppendDuration:    manifestAppendDuration,
+		manifestAppendCasRetries:  manifestAppendCasRetries,
 		headOfLineBlockDuration:   headOfLineBlockDuration,
 		batchOutcomeTotal:         batchOutcomeTotal,
 		haltedGauge:               haltedGauge,
@@ -602,9 +648,11 @@ func (t *exporterTelemetry) OnManifestAppendBatchSize(n int) {
 	t.manifestAppendBatchSize.Record(context.Background(), int64(n))
 }
 
-func (t *exporterTelemetry) OnManifestAppendDuration(d time.Duration, _ int, err error) {
-	t.manifestAppendDuration.Record(context.Background(), d.Seconds(),
-		metric.WithAttributes(resultAttr(err)))
+func (t *exporterTelemetry) OnManifestAppendDuration(d time.Duration, conflicts int, err error) {
+	ctx := context.Background()
+	attrs := metric.WithAttributes(resultAttr(err))
+	t.manifestAppendDuration.Record(ctx, d.Seconds(), attrs)
+	t.manifestAppendCasRetries.Record(ctx, int64(conflicts), attrs)
 }
 
 func (t *exporterTelemetry) OnHeadOfLineBlock(d time.Duration) {
