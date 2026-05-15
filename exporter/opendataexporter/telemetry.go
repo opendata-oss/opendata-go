@@ -2,6 +2,7 @@ package opendataexporter
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	"github.com/opendata-oss/opendata-go/buffer"
@@ -59,8 +60,27 @@ type exporterTelemetry struct {
 	inflightBatchesGauge    metric.Int64Gauge
 	queueDepthGauge         metric.Int64Gauge
 
+	// `producer.oldest_unflushed_batch_age_seconds` is an
+	// asynchronous (observable) gauge — its callback fires on every
+	// OTel-SDK collection cycle and reads `Producer.
+	// OldestUnflushedBatchAge()`. Async gauges fit the source-of-
+	// truth shape better than periodically-recorded sync gauges
+	// (which would lie about the age between Record calls). The
+	// producer is created after the telemetry struct exists, so the
+	// callback dereferences an atomic pointer set by `exporter.
+	// Start()` and zeroed by `Shutdown()`.
+	oldestUnflushedAge metric.Float64ObservableGauge
+	producer           atomic.Pointer[buffer.Producer]
+
 	slowRequestThreshold time.Duration
 	slowFlushThreshold   time.Duration
+}
+
+// setProducer wires the live producer reference into the
+// asynchronous-gauge callback. Called by the exporter once the
+// producer goroutine is up. Pass nil from Shutdown to detach.
+func (t *exporterTelemetry) setProducer(p *buffer.Producer) {
+	t.producer.Store(p)
 }
 
 func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporterTelemetry, error) {
@@ -332,7 +352,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		threshold = 5 * time.Second
 	}
 
-	return &exporterTelemetry{
+	t := &exporterTelemetry{
 		logger:                    logger,
 		requestsTotal:             requestsTotal,
 		requestFailuresTotal:      requestFailuresTotal,
@@ -370,7 +390,36 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		queueDepthGauge:           queueDepthGauge,
 		slowRequestThreshold:      threshold,
 		slowFlushThreshold:        threshold,
-	}, nil
+	}
+
+	// Asynchronous gauge — registered with a callback that reads from
+	// the producer atomic. Because the producer doesn't exist at the
+	// moment telemetry is constructed (it's created later in
+	// exporter.Start), the callback observes 0 until `setProducer`
+	// has been called with a live `*buffer.Producer`.
+	oldestUnflushedAge, err := meter.Float64ObservableGauge(
+		"buffer.producer.oldest_unflushed_batch_age_seconds",
+		metric.WithUnit("s"),
+		metric.WithDescription(
+			"Wall-clock age of the oldest record sitting in the producer's "+
+				"current batch accumulator. Drops to zero on rotation. The "+
+				"Phase 8 cell-bench bottleneck classifier reads this gauge "+
+				"to detect the 'rotator wedged on appendCh while records "+
+				"pile up' regime.",
+		),
+		metric.WithFloat64Callback(func(_ context.Context, o metric.Float64Observer) error {
+			if p := t.producer.Load(); p != nil {
+				o.Observe(p.OldestUnflushedBatchAge().Seconds())
+			}
+			return nil
+		}),
+	)
+	if err != nil {
+		return nil, err
+	}
+	t.oldestUnflushedAge = oldestUnflushedAge
+
+	return t, nil
 }
 
 type componentTelemetrySettings struct {

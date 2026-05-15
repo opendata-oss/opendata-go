@@ -103,6 +103,10 @@ func (e *openDataExporter) Start(ctx context.Context, _ component.Host) error {
 	producerConfig.Observer = e.telemetry
 
 	e.producer = buffer.NewProducer(store, producerConfig)
+	// Wire the producer into the telemetry's async-gauge callback so
+	// `buffer.producer.oldest_unflushed_batch_age_seconds` starts
+	// reporting non-zero values on the next OTel collection cycle.
+	e.telemetry.setProducer(e.producer)
 	e.telemetry.logger.Info(
 		"Starting OpenData exporter",
 		zap.String("signal", signalLabel(e.signalType)),
@@ -126,6 +130,9 @@ func (e *openDataExporter) Shutdown(ctx context.Context) error {
 	if p == nil {
 		return nil
 	}
+	// Detach from the async-gauge callback before tearing down so
+	// the callback can't observe a closed producer mid-Close.
+	e.telemetry.setProducer(nil)
 	return p.Close(ctx)
 }
 
