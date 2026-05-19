@@ -140,7 +140,12 @@ func (e *openDataExporter) Shutdown(ctx context.Context) error {
 }
 
 func (e *openDataExporter) Capabilities() consumer.Capabilities {
-	return consumer.Capabilities{MutatesData: false}
+	// MutatesData is true on the logs path because ConsumeLogs stamps
+	// `_odb_gateway_received_at` onto every ResourceLogs.Resource() so
+	// the downstream ingestor can compute end-to-end latency against
+	// CH's server-side now64(9). Metrics doesn't stamp today; the bit
+	// is reported once and applies to whichever signal is configured.
+	return consumer.Capabilities{MutatesData: true}
 }
 
 func (e *openDataExporter) ConsumeMetrics(ctx context.Context, md pmetric.Metrics) error {
@@ -180,6 +185,15 @@ func (e *openDataExporter) ConsumeLogs(ctx context.Context, ld plog.Logs) error 
 	}
 
 	start := time.Now()
+	// Stamp `_odb_gateway_received_at` on every ResourceLogs.Resource()
+	// before any further work. Per OTLP-request granularity: every
+	// ResourceLogs in this Consume call shares the same nanosecond
+	// stamp. The intra-request fanout is sub-millisecond and not the
+	// signal we want to surface; per-request keeps the storage cost at
+	// `8B × distinct OTLP requests` rather than `8B × records`. See
+	// plans/odb-high-throughput/stage2-e2e-latency-impl.md.
+	stampGatewayReceivedAt(ld, time.Now().UnixNano())
+
 	logRecordCount := ld.LogRecordCount()
 	e.telemetry.recordRequestStartLogs(ctx, logRecordCount)
 
@@ -228,6 +242,25 @@ func (e *openDataExporter) appendAndAwait(ctx context.Context, payload []byte) e
 		return err
 	}
 	return nil
+}
+
+// gatewayReceivedAtAttrKey is the OTLP Resource attribute the gateway
+// stamps with `time.Now().UnixNano()` on each incoming OTLP logs
+// request. The contrib clickhouse-ingestor adapter extracts this
+// attribute into a typed CH `Nullable(DateTime64(9))` column (paired
+// with a server-side `_odb_clickhouse_inserted_at DEFAULT now64(9)`
+// column) so harness queries can compute end-to-end latency
+// distributions per run.
+const gatewayReceivedAtAttrKey = "_odb_gateway_received_at"
+
+// stampGatewayReceivedAt writes `stampUnixNano` as an IntValue under
+// `gatewayReceivedAtAttrKey` on every ResourceLogs.Resource() in `ld`.
+// Factored out so unit tests can drive it directly.
+func stampGatewayReceivedAt(ld plog.Logs, stampUnixNano int64) {
+	rls := ld.ResourceLogs()
+	for i := 0; i < rls.Len(); i++ {
+		rls.At(i).Resource().Attributes().PutInt(gatewayReceivedAtAttrKey, stampUnixNano)
+	}
 }
 
 func signalLabel(signalType uint8) string {
