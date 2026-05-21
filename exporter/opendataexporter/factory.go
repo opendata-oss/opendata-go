@@ -65,6 +65,19 @@ func createDefaultConfig() component.Config {
 	}
 }
 
+// timeoutOptions returns a slice of exporterhelper.Option that adds
+// WithTimeout iff the user configured a non-zero Timeout. A zero value
+// preserves exporterhelper's default 5s TimeoutConfig — i.e. no behavior
+// change unless the cell YAML opts in.
+func timeoutOptions(c *Config) []exporterhelper.Option {
+	if c.Timeout > 0 {
+		return []exporterhelper.Option{
+			exporterhelper.WithTimeout(exporterhelper.TimeoutConfig{Timeout: c.Timeout}),
+		}
+	}
+	return nil
+}
+
 func createMetricsExporter(ctx context.Context, set exporter.Settings, cfg component.Config) (exporter.Metrics, error) {
 	c := cfg.(*Config)
 	inner, err := newOpenDataExporterForSignalWithTelemetry(c, SignalTypeMetrics, componentTelemetrySettings{
@@ -74,13 +87,14 @@ func createMetricsExporter(ctx context.Context, set exporter.Settings, cfg compo
 	if err != nil {
 		return nil, err
 	}
-	return exporterhelper.NewMetrics(
-		ctx, set, c, inner.ConsumeMetrics,
+	opts := []exporterhelper.Option{
 		exporterhelper.WithStart(inner.Start),
 		exporterhelper.WithShutdown(inner.Shutdown),
 		exporterhelper.WithCapabilities(inner.Capabilities()),
 		exporterhelper.WithQueue(c.SendingQueue),
-	)
+	}
+	opts = append(opts, timeoutOptions(c)...)
+	return exporterhelper.NewMetrics(ctx, set, c, inner.ConsumeMetrics, opts...)
 }
 
 func createLogsExporter(ctx context.Context, set exporter.Settings, cfg component.Config) (exporter.Logs, error) {
@@ -98,13 +112,14 @@ func createLogsExporter(ctx context.Context, set exporter.Settings, cfg componen
 	if err != nil {
 		return nil, err
 	}
-	return exporterhelper.NewLogs(
-		ctx, set, &local, inner.ConsumeLogs,
+	opts := []exporterhelper.Option{
 		exporterhelper.WithStart(inner.Start),
 		exporterhelper.WithShutdown(inner.Shutdown),
 		exporterhelper.WithCapabilities(inner.Capabilities()),
 		exporterhelper.WithQueue(local.SendingQueue),
-	)
+	}
+	opts = append(opts, timeoutOptions(&local)...)
+	return exporterhelper.NewLogs(ctx, set, &local, inner.ConsumeLogs, opts...)
 }
 
 // applyLogsPathDefaults swaps the metrics-flavored default DataPathPrefix and

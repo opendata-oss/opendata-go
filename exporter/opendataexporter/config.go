@@ -79,6 +79,18 @@ type Config struct {
 	// Default (NewDefaultQueueConfig): enabled, NumConsumers=10,
 	// QueueSize=1000, BlockOnOverflow=false.
 	SendingQueue configoptional.Optional[exporterhelper.QueueBatchConfig] `mapstructure:"sending_queue"`
+
+	// Timeout is the per-call ceiling that exporterhelper applies to
+	// ConsumeLogs/Metrics. Crossing it cancels the in-flight call and
+	// drops the batch with "context deadline exceeded". Standard
+	// exporterhelper default (NewDefaultTimeoutConfig) is 5s, which is
+	// too tight under high-concurrency manifest CAS contention — the
+	// p99.5 of `opendataexporter_durable_wait_duration_seconds` ran
+	// 2-3s in row 8.4 validation, with bursts past 5s when CH merge
+	// pressure spiked. Configure explicitly per cell. A value of 0
+	// preserves exporterhelper's 5s default; any positive duration is
+	// passed verbatim to exporterhelper.WithTimeout.
+	Timeout time.Duration `mapstructure:"timeout"`
 }
 
 // Validate checks whether the exporter configuration is usable.
@@ -130,6 +142,9 @@ func (c *Config) Validate() error {
 		if err := c.SendingQueue.Get().Validate(); err != nil {
 			return fmt.Errorf("sending_queue: %w", err)
 		}
+	}
+	if c.Timeout < 0 {
+		return fmt.Errorf("timeout must be >= 0 (got %s); 0 inherits exporterhelper default", c.Timeout)
 	}
 
 	switch strings.ToLower(c.Compression) {
