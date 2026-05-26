@@ -1,6 +1,7 @@
 package objstore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -57,21 +58,28 @@ func (s *S3) Get(ctx context.Context, path string) (GetResult, error) {
 }
 
 // Put implements ObjectStore.
+//
+// Wraps `data` in a bytes.Reader rather than copying it through a
+// string. Building the request body with strings.NewReader(string(data))
+// would force an allocation + memcpy of the full payload; for batches
+// in the megabytes-to-tens-of-megabytes range that copy would be the
+// dominant memory cost of the PUT path.
 func (s *S3) Put(ctx context.Context, path string, data []byte) error {
 	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: &s.bucket,
 		Key:    &path,
-		Body:   strings.NewReader(string(data)),
+		Body:   bytes.NewReader(data),
 	})
 	return err
 }
 
-// PutIfMatch implements ObjectStore.
+// PutIfMatch implements ObjectStore. Same zero-copy body wrapper as
+// Put.
 func (s *S3) PutIfMatch(ctx context.Context, path string, data []byte, version *Version) error {
 	input := &s3.PutObjectInput{
 		Bucket: &s.bucket,
 		Key:    &path,
-		Body:   strings.NewReader(string(data)),
+		Body:   bytes.NewReader(data),
 	}
 	if version == nil {
 		input.IfNoneMatch = aws.String("*")

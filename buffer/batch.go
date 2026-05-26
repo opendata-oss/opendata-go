@@ -32,6 +32,15 @@ const (
 // compression. The format is:
 //
 //	[compressed record block] [compression_type: u8] [record_count: u32 LE] [version: u16 LE]
+//
+// Memory shape:
+//   - CompressionNone: writes length-prefix + entry bytes + footer into one
+//     buffer of capacity `dataSize + batchFooterSize`. No intermediate
+//     uncompressed-block allocation, no full-buffer copy at footer time.
+//   - CompressionZstd: builds the uncompressed length-prefixed block once,
+//     then asks zstd.EncodeAll to append-into a pre-sized output buffer
+//     (capacity hint = dataSize/2 + footer). Avoids a separate
+//     compressed→final-buffer copy.
 func EncodeBatch(entries [][]byte, compression CompressionType) ([]byte, error) {
 	// Compute uncompressed entry block size.
 	dataSize := 0
@@ -42,35 +51,41 @@ func EncodeBatch(entries [][]byte, compression CompressionType) ([]byte, error) 
 		dataSize += batchEntryLenSize + len(e)
 	}
 
-	entryBuf := make([]byte, 0, dataSize)
-	for _, e := range entries {
-		entryBuf = binary.LittleEndian.AppendUint32(entryBuf, uint32(len(e)))
-		entryBuf = append(entryBuf, e...)
-	}
-
-	var compressed []byte
 	switch compression {
 	case CompressionNone:
-		compressed = entryBuf
+		buf := make([]byte, 0, dataSize+batchFooterSize)
+		for _, e := range entries {
+			buf = binary.LittleEndian.AppendUint32(buf, uint32(len(e)))
+			buf = append(buf, e...)
+		}
+		buf = append(buf, byte(compression))
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(entries)))
+		buf = binary.LittleEndian.AppendUint16(buf, batchVersion)
+		return buf, nil
 	case CompressionZstd:
+		entryBuf := make([]byte, 0, dataSize)
+		for _, e := range entries {
+			entryBuf = binary.LittleEndian.AppendUint32(entryBuf, uint32(len(e)))
+			entryBuf = append(entryBuf, e...)
+		}
 		enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
 		if err != nil {
 			return nil, serializationErr(fmt.Sprintf("zstd encoder init failed: %v", err))
 		}
-		compressed = enc.EncodeAll(entryBuf, nil)
+		// 2x compression is a conservative hint for OTLP-shaped payloads;
+		// EncodeAll grows the destination if needed.
+		buf := make([]byte, 0, dataSize/2+batchFooterSize)
+		buf = enc.EncodeAll(entryBuf, buf)
 		if err := enc.Close(); err != nil {
 			return nil, serializationErr(fmt.Sprintf("zstd encoder close failed: %v", err))
 		}
+		buf = append(buf, byte(compression))
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(entries)))
+		buf = binary.LittleEndian.AppendUint16(buf, batchVersion)
+		return buf, nil
 	default:
 		return nil, serializationErr(fmt.Sprintf("unsupported compression type: %d", compression))
 	}
-
-	buf := make([]byte, 0, len(compressed)+batchFooterSize)
-	buf = append(buf, compressed...)
-	buf = append(buf, byte(compression))
-	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(entries)))
-	buf = binary.LittleEndian.AppendUint16(buf, batchVersion)
-	return buf, nil
 }
 
 // DecodeBatch deserializes a binary batch into its constituent entries.
