@@ -2,6 +2,7 @@ package opendataexporter
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	"github.com/opendata-oss/opendata-go/buffer"
@@ -12,6 +13,22 @@ import (
 )
 
 const telemetryScopeName = "github.com/opendata-oss/opendata-go/exporter/opendataexporter"
+
+// Histogram bucket boundaries. The OTel-SDK default buckets
+// (`[0, 5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500, 5000,
+// 7500, 10000]`) saturate the [0,5] bucket for both seconds-scale
+// latencies (manifest CAS ~90 ms, durable wait ~400 ms) and
+// small-integer counts (manifest coalesce 1-40). Quantile estimators
+// then degenerate to `boundary × quantile_fraction`, making p50/p99
+// reads useless. These bucket sets fit the actual distributions
+// observed in practice: sub-millisecond fast paths through several
+// seconds of tail, and integer counts in the 1-128 range.
+var (
+	latencySecondsBuckets = []float64{
+		0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+	}
+	smallIntegerCountBuckets = []float64{1, 2, 4, 8, 16, 32, 64, 128}
+)
 
 type exporterTelemetry struct {
 	logger *zap.Logger
@@ -38,8 +55,51 @@ type exporterTelemetry struct {
 	manifestConflictsTotal    metric.Int64Counter
 	manifestConflictsPerWrite metric.Int64Histogram
 
+	// Producer-pipeline metrics, named under the `buffer.producer.*`
+	// namespace. The instruments live in the exporter rather than the
+	// buffer package because the buffer is provider-agnostic; the
+	// exporter wires the buffer's Observer hooks to OTel.
+	appendChBlockDuration   metric.Float64Histogram
+	encodeWorkersBusy       metric.Int64Gauge
+	uploadWorkersBusy       metric.Int64Gauge
+	encodeDuration          metric.Float64Histogram
+	uploadDuration          metric.Float64Histogram
+	manifestAppendBatchSize metric.Int64Histogram
+	manifestAppendDuration  metric.Float64Histogram
+	// manifestAppendCasRetries records the `conflicts` argument from
+	// `OnManifestAppendDuration`. `opendataexporter.manifest_conflicts_per_write`
+	// records the same value through `OnManifestEnqueue`; both observers
+	// fire from the same CAS site (producer.go ~ line 1010) and are both
+	// wired so existing dashboards keep working.
+	manifestAppendCasRetries metric.Int64Histogram
+	headOfLineBlockDuration  metric.Float64Histogram
+	batchOutcomeTotal        metric.Int64Counter
+	haltedGauge              metric.Int64Gauge
+	inflightBytesGauge       metric.Int64Gauge
+	inflightBatchesGauge     metric.Int64Gauge
+	queueDepthGauge          metric.Int64Gauge
+
+	// `producer.oldest_unflushed_batch_age_seconds` is an
+	// asynchronous (observable) gauge — its callback fires on every
+	// OTel-SDK collection cycle and reads `Producer.
+	// OldestUnflushedBatchAge()`. Async gauges fit the source-of-
+	// truth shape better than periodically-recorded sync gauges
+	// (which would lie about the age between Record calls). The
+	// producer is created after the telemetry struct exists, so the
+	// callback dereferences an atomic pointer set by `exporter.
+	// Start()` and zeroed by `Shutdown()`.
+	oldestUnflushedAge metric.Float64ObservableGauge
+	producer           atomic.Pointer[buffer.Producer]
+
 	slowRequestThreshold time.Duration
 	slowFlushThreshold   time.Duration
+}
+
+// setProducer wires the live producer reference into the
+// asynchronous-gauge callback. Called by the exporter once the
+// producer goroutine is up. Pass nil from Shutdown to detach.
+func (t *exporterTelemetry) setProducer(p *buffer.Producer) {
+	t.producer.Store(p)
 }
 
 func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporterTelemetry, error) {
@@ -100,6 +160,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		"opendataexporter.marshal_duration_seconds",
 		metric.WithUnit("s"),
 		metric.WithDescription("Time spent marshaling OTLP metrics payloads."),
+		metric.WithExplicitBucketBoundaries(latencySecondsBuckets...),
 	)
 	if err != nil {
 		return nil, err
@@ -108,6 +169,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		"opendataexporter.enqueue_wait_duration_seconds",
 		metric.WithUnit("s"),
 		metric.WithDescription("Time spent waiting to hand a payload to the buffer."),
+		metric.WithExplicitBucketBoundaries(latencySecondsBuckets...),
 	)
 	if err != nil {
 		return nil, err
@@ -116,6 +178,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		"opendataexporter.durable_wait_duration_seconds",
 		metric.WithUnit("s"),
 		metric.WithDescription("Time from request receipt until the payload is durably flushed."),
+		metric.WithExplicitBucketBoundaries(latencySecondsBuckets...),
 	)
 	if err != nil {
 		return nil, err
@@ -138,6 +201,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		"opendataexporter.flush_duration_seconds",
 		metric.WithUnit("s"),
 		metric.WithDescription("Time spent writing a batch to storage and enqueueing it in the manifest."),
+		metric.WithExplicitBucketBoundaries(latencySecondsBuckets...),
 	)
 	if err != nil {
 		return nil, err
@@ -167,6 +231,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		"opendataexporter.batch_age_seconds",
 		metric.WithUnit("s"),
 		metric.WithDescription("Age of a batch when it is flushed."),
+		metric.WithExplicitBucketBoundaries(latencySecondsBuckets...),
 	)
 	if err != nil {
 		return nil, err
@@ -175,6 +240,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		"opendataexporter.store_put_duration_seconds",
 		metric.WithUnit("s"),
 		metric.WithDescription("Time spent writing batch objects to object storage."),
+		metric.WithExplicitBucketBoundaries(latencySecondsBuckets...),
 	)
 	if err != nil {
 		return nil, err
@@ -190,6 +256,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		"opendataexporter.manifest_enqueue_duration_seconds",
 		metric.WithUnit("s"),
 		metric.WithDescription("Time spent appending a flushed batch to the queue manifest."),
+		metric.WithExplicitBucketBoundaries(latencySecondsBuckets...),
 	)
 	if err != nil {
 		return nil, err
@@ -204,6 +271,118 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 	manifestConflictsPerWrite, err := meter.Int64Histogram(
 		"opendataexporter.manifest_conflicts_per_write",
 		metric.WithDescription("Number of optimistic concurrency conflicts encountered by each manifest write."),
+		metric.WithExplicitBucketBoundaries(smallIntegerCountBuckets...),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	appendChBlockDuration, err := meter.Float64Histogram(
+		"buffer.producer.appendch_block_seconds",
+		metric.WithUnit("s"),
+		metric.WithDescription("Time Append/AppendContext spent blocked on the appendCh send (zero in the common no-backpressure case)."),
+		metric.WithExplicitBucketBoundaries(latencySecondsBuckets...),
+	)
+	if err != nil {
+		return nil, err
+	}
+	encodeWorkersBusy, err := meter.Int64Gauge(
+		"buffer.producer.encode_workers_busy",
+		metric.WithDescription("Encoder workers currently encoding."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	uploadWorkersBusy, err := meter.Int64Gauge(
+		"buffer.producer.upload_workers_busy",
+		metric.WithDescription("Uploader workers currently uploading."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	encodeDuration, err := meter.Float64Histogram(
+		"buffer.producer.encode_duration_seconds",
+		metric.WithUnit("s"),
+		metric.WithDescription("Per-batch encode wall time."),
+		metric.WithExplicitBucketBoundaries(latencySecondsBuckets...),
+	)
+	if err != nil {
+		return nil, err
+	}
+	uploadDuration, err := meter.Float64Histogram(
+		"buffer.producer.upload_duration_seconds",
+		metric.WithUnit("s"),
+		metric.WithDescription("Per-batch object-PUT wall time (one sample per attempt)."),
+		metric.WithExplicitBucketBoundaries(latencySecondsBuckets...),
+	)
+	if err != nil {
+		return nil, err
+	}
+	manifestAppendBatchSize, err := meter.Int64Histogram(
+		"buffer.producer.manifest_append_batch_size",
+		metric.WithDescription("Ordinals coalesced into a single CAS round trip."),
+		metric.WithExplicitBucketBoundaries(smallIntegerCountBuckets...),
+	)
+	if err != nil {
+		return nil, err
+	}
+	manifestAppendDuration, err := meter.Float64Histogram(
+		"buffer.producer.manifest_append_duration_seconds",
+		metric.WithUnit("s"),
+		metric.WithDescription("Per-CAS manifest write wall time."),
+		metric.WithExplicitBucketBoundaries(latencySecondsBuckets...),
+	)
+	if err != nil {
+		return nil, err
+	}
+	manifestAppendCasRetries, err := meter.Int64Histogram(
+		"buffer.producer.manifest_append_cas_retries",
+		metric.WithDescription("CAS conflict count per manifest append (0 on first-attempt success)."),
+		metric.WithExplicitBucketBoundaries(smallIntegerCountBuckets...),
+	)
+	if err != nil {
+		return nil, err
+	}
+	headOfLineBlockDuration, err := meter.Float64Histogram(
+		"buffer.producer.head_of_line_block_seconds",
+		metric.WithUnit("s"),
+		metric.WithDescription("Time the manifest committer waited for the next-expected ordinal while later ordinals were already ready."),
+		metric.WithExplicitBucketBoundaries(latencySecondsBuckets...),
+	)
+	if err != nil {
+		return nil, err
+	}
+	batchOutcomeTotal, err := meter.Int64Counter(
+		"buffer.producer.batch_outcome",
+		metric.WithDescription("Per-batch terminal outcome count (one series per outcome attribute)."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	haltedGauge, err := meter.Int64Gauge(
+		"buffer.producer.halted",
+		metric.WithDescription("1 when the producer has entered the halted state, 0 otherwise."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	inflightBytesGauge, err := meter.Int64Gauge(
+		"buffer.producer.inflight_bytes",
+		metric.WithDescription("Total encoded-payload bytes in-flight."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	inflightBatchesGauge, err := meter.Int64Gauge(
+		"buffer.producer.inflight_batches",
+		metric.WithDescription("Batches currently reserved against MaxInFlightBatches."),
+	)
+	if err != nil {
+		return nil, err
+	}
+	queueDepthGauge, err := meter.Int64Gauge(
+		"buffer.producer.queue_depth",
+		metric.WithDescription("Per-stage queue / inflight count (one series per stage attribute)."),
 	)
 	if err != nil {
 		return nil, err
@@ -214,7 +393,7 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		threshold = 5 * time.Second
 	}
 
-	return &exporterTelemetry{
+	t := &exporterTelemetry{
 		logger:                    logger,
 		requestsTotal:             requestsTotal,
 		requestFailuresTotal:      requestFailuresTotal,
@@ -237,9 +416,51 @@ func newExporterTelemetry(set componentTelemetrySettings, cfg Config) (*exporter
 		manifestEnqueueDuration:   manifestEnqueueDuration,
 		manifestConflictsTotal:    manifestConflictsTotal,
 		manifestConflictsPerWrite: manifestConflictsPerWrite,
+		appendChBlockDuration:     appendChBlockDuration,
+		encodeWorkersBusy:         encodeWorkersBusy,
+		uploadWorkersBusy:         uploadWorkersBusy,
+		encodeDuration:            encodeDuration,
+		uploadDuration:            uploadDuration,
+		manifestAppendBatchSize:   manifestAppendBatchSize,
+		manifestAppendDuration:    manifestAppendDuration,
+		manifestAppendCasRetries:  manifestAppendCasRetries,
+		headOfLineBlockDuration:   headOfLineBlockDuration,
+		batchOutcomeTotal:         batchOutcomeTotal,
+		haltedGauge:               haltedGauge,
+		inflightBytesGauge:        inflightBytesGauge,
+		inflightBatchesGauge:      inflightBatchesGauge,
+		queueDepthGauge:           queueDepthGauge,
 		slowRequestThreshold:      threshold,
 		slowFlushThreshold:        threshold,
-	}, nil
+	}
+
+	// Asynchronous gauge — registered with a callback that reads from
+	// the producer atomic. Because the producer doesn't exist at the
+	// moment telemetry is constructed (it's created later in
+	// exporter.Start), the callback observes 0 until `setProducer`
+	// has been called with a live `*buffer.Producer`.
+	oldestUnflushedAge, err := meter.Float64ObservableGauge(
+		"buffer.producer.oldest_unflushed_batch_age_seconds",
+		metric.WithUnit("s"),
+		metric.WithDescription(
+			"Wall-clock age of the oldest record sitting in the producer's "+
+				"current batch accumulator. Drops to zero on rotation. Read "+
+				"this gauge to detect the 'rotator wedged on appendCh while "+
+				"records pile up' regime.",
+		),
+		metric.WithFloat64Callback(func(_ context.Context, o metric.Float64Observer) error {
+			if p := t.producer.Load(); p != nil {
+				o.Observe(p.OldestUnflushedBatchAge().Seconds())
+			}
+			return nil
+		}),
+	)
+	if err != nil {
+		return nil, err
+	}
+	t.oldestUnflushedAge = oldestUnflushedAge
+
+	return t, nil
 }
 
 type componentTelemetrySettings struct {
@@ -388,4 +609,72 @@ func resultAttr(err error) attribute.KeyValue {
 		return attribute.String("result", "error")
 	}
 	return attribute.String("result", "success")
+}
+
+// Observer hooks: wired to concrete OTel metric instruments. These
+// implement buffer.Observer so the provider-agnostic buffer can report
+// pipeline metrics through OTel.
+
+func (t *exporterTelemetry) OnAppendChBlock(d time.Duration) {
+	t.appendChBlockDuration.Record(context.Background(), d.Seconds())
+}
+
+func (t *exporterTelemetry) OnWorkersBusy(stage buffer.PipelineStage, busy int) {
+	switch stage {
+	case buffer.StageEncode:
+		t.encodeWorkersBusy.Record(context.Background(), int64(busy))
+	case buffer.StageUpload:
+		t.uploadWorkersBusy.Record(context.Background(), int64(busy))
+	}
+}
+
+func (t *exporterTelemetry) OnEncodeDuration(d time.Duration, err error) {
+	t.encodeDuration.Record(context.Background(), d.Seconds(),
+		metric.WithAttributes(resultAttr(err)))
+}
+
+func (t *exporterTelemetry) OnUploadDuration(d time.Duration, _ int, err error) {
+	t.uploadDuration.Record(context.Background(), d.Seconds(),
+		metric.WithAttributes(resultAttr(err)))
+}
+
+func (t *exporterTelemetry) OnManifestAppendBatchSize(n int) {
+	t.manifestAppendBatchSize.Record(context.Background(), int64(n))
+}
+
+func (t *exporterTelemetry) OnManifestAppendDuration(d time.Duration, conflicts int, err error) {
+	ctx := context.Background()
+	attrs := metric.WithAttributes(resultAttr(err))
+	t.manifestAppendDuration.Record(ctx, d.Seconds(), attrs)
+	t.manifestAppendCasRetries.Record(ctx, int64(conflicts), attrs)
+}
+
+func (t *exporterTelemetry) OnHeadOfLineBlock(d time.Duration) {
+	t.headOfLineBlockDuration.Record(context.Background(), d.Seconds())
+}
+
+func (t *exporterTelemetry) OnBatchOutcome(outcome buffer.BatchOutcome) {
+	t.batchOutcomeTotal.Add(context.Background(), 1,
+		metric.WithAttributes(attribute.String("outcome", string(outcome))))
+}
+
+func (t *exporterTelemetry) OnHalted(halted bool) {
+	v := int64(0)
+	if halted {
+		v = 1
+	}
+	t.haltedGauge.Record(context.Background(), v)
+}
+
+func (t *exporterTelemetry) OnInflightBytes(bytes int64) {
+	t.inflightBytesGauge.Record(context.Background(), bytes)
+}
+
+func (t *exporterTelemetry) OnInflightBatches(batches int) {
+	t.inflightBatchesGauge.Record(context.Background(), int64(batches))
+}
+
+func (t *exporterTelemetry) OnQueueDepth(stage buffer.PipelineStage, depth int) {
+	t.queueDepthGauge.Record(context.Background(), int64(depth),
+		metric.WithAttributes(attribute.String("stage", string(stage))))
 }

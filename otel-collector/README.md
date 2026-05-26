@@ -1,7 +1,7 @@
 # otel-collector/ — custom OTel collector image (OpenData exporter bundled)
 
-The Phase 8 cell gateway runs an OTel collector that needs the
-in-repo `opendataexporter`. Stock `otelcol-contrib` doesn't include it;
+A production OTel collector deployment needs the in-repo
+`opendataexporter`. Stock `otelcol-contrib` doesn't include it;
 this directory bakes a custom collector binary instead.
 
 ## Build locally
@@ -29,7 +29,7 @@ from the GitHub UI or:
 
 ```
 gh workflow run "Build OTel collector image" \
-  --ref odb-ht/3-producer-pipelining \
+  --ref main \
   -R opendata-oss/opendata-go
 ```
 

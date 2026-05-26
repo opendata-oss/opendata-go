@@ -24,9 +24,14 @@ func TestOpenDataExporterConsumeMetricsRoundTrip(t *testing.T) {
 		},
 		DataPathPrefix: "ingest/otel/metrics/data",
 		ManifestPath:   "ingest/otel/metrics/manifest",
-		FlushInterval:  24 * time.Hour,
-		FlushSizeBytes: 1,
-		Compression:    compressionNone,
+		FlushInterval:      24 * time.Hour,
+		FlushSizeBytes:     1,
+		Compression:        compressionNone,
+		UploadConcurrency:       1,
+		EncodeConcurrency:       1,
+		MaxInFlightBatches:      64,
+		MaxInFlightBytes:        256 * 1024 * 1024,
+		ManifestAppendBatchSize: 1,
 	}
 
 	exp := newOpenDataExporter(cfg)
@@ -140,9 +145,14 @@ func TestOpenDataExporterConsumeLogsRoundTrip(t *testing.T) {
 		},
 		DataPathPrefix: "ingest/otel/logs/data",
 		ManifestPath:   "ingest/otel/logs/manifest",
-		FlushInterval:  24 * time.Hour,
-		FlushSizeBytes: 1,
-		Compression:    compressionNone,
+		FlushInterval:      24 * time.Hour,
+		FlushSizeBytes:     1,
+		Compression:        compressionNone,
+		UploadConcurrency:       1,
+		EncodeConcurrency:       1,
+		MaxInFlightBatches:      64,
+		MaxInFlightBytes:        256 * 1024 * 1024,
+		ManifestAppendBatchSize: 1,
 	}
 
 	exp := newOpenDataExporterForSignal(cfg, SignalTypeLogs)
@@ -266,9 +276,14 @@ func TestMetricsAndLogsExportersDoNotCrossContaminate(t *testing.T) {
 		},
 		DataPathPrefix: "ingest/otel/metrics/data",
 		ManifestPath:   "ingest/otel/metrics/manifest",
-		FlushInterval:  24 * time.Hour,
-		FlushSizeBytes: 1,
-		Compression:    compressionNone,
+		FlushInterval:      24 * time.Hour,
+		FlushSizeBytes:     1,
+		Compression:        compressionNone,
+		UploadConcurrency:       1,
+		EncodeConcurrency:       1,
+		MaxInFlightBatches:      64,
+		MaxInFlightBytes:        256 * 1024 * 1024,
+		ManifestAppendBatchSize: 1,
 	}
 	logsCfg := &Config{
 		ObjectStore: ObjectStoreConfig{
@@ -278,9 +293,14 @@ func TestMetricsAndLogsExportersDoNotCrossContaminate(t *testing.T) {
 		},
 		DataPathPrefix: "ingest/otel/logs/data",
 		ManifestPath:   "ingest/otel/logs/manifest",
-		FlushInterval:  24 * time.Hour,
-		FlushSizeBytes: 1,
-		Compression:    compressionNone,
+		FlushInterval:      24 * time.Hour,
+		FlushSizeBytes:     1,
+		Compression:        compressionNone,
+		UploadConcurrency:       1,
+		EncodeConcurrency:       1,
+		MaxInFlightBatches:      64,
+		MaxInFlightBytes:        256 * 1024 * 1024,
+		ManifestAppendBatchSize: 1,
 	}
 
 	metricsExp := newOpenDataExporterForSignal(metricsCfg, SignalTypeMetrics)
@@ -387,4 +407,153 @@ func testMetrics() pmetric.Metrics {
 	dp.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(1_700_000_000, 0)))
 
 	return md
+}
+
+// Gateway-received timestamp stamp.
+
+func TestStampGatewayReceivedAtStampsAllResourceLogs(t *testing.T) {
+	ld := plog.NewLogs()
+	rl1 := ld.ResourceLogs().AppendEmpty()
+	rl1.Resource().Attributes().PutStr("service.name", "a")
+	rl1.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("a-rec")
+	rl2 := ld.ResourceLogs().AppendEmpty()
+	rl2.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("b-rec")
+
+	const stamp int64 = 1_700_000_000_123_456_789
+	stampGatewayReceivedAt(ld, stamp)
+
+	v1, ok := rl1.Resource().Attributes().Get(gatewayReceivedAtAttrKey)
+	if !ok {
+		t.Fatalf("rl1 missing %s", gatewayReceivedAtAttrKey)
+	}
+	if v1.Type() != pcommon.ValueTypeInt {
+		t.Fatalf("rl1 stamp type: got %v want Int", v1.Type())
+	}
+	if v1.Int() != stamp {
+		t.Errorf("rl1 stamp value: got %d want %d", v1.Int(), stamp)
+	}
+
+	v2, ok := rl2.Resource().Attributes().Get(gatewayReceivedAtAttrKey)
+	if !ok {
+		t.Fatalf("rl2 missing %s", gatewayReceivedAtAttrKey)
+	}
+	if v2.Int() != stamp {
+		t.Errorf("rl2 stamp value: got %d want %d (must equal rl1 — same OTLP request)", v2.Int(), stamp)
+	}
+
+	// Existing Resource attributes must survive the mutation unharmed.
+	if got, _ := rl1.Resource().Attributes().Get("service.name"); got.Str() != "a" {
+		t.Errorf("rl1 service.name clobbered: got %q want %q", got.Str(), "a")
+	}
+}
+
+func TestStampGatewayReceivedAtIsNoopOnEmpty(t *testing.T) {
+	// A logs payload with no ResourceLogs (degenerate but legal) must
+	// not panic when stamped.
+	ld := plog.NewLogs()
+	stampGatewayReceivedAt(ld, 1)
+	if ld.ResourceLogs().Len() != 0 {
+		t.Fatalf("ResourceLogs grew: got %d want 0", ld.ResourceLogs().Len())
+	}
+}
+
+func TestConsumeLogsStampsGatewayReceivedAt(t *testing.T) {
+	// Full path: ConsumeLogs stamps before marshal. We verify by
+	// unmarshaling the marshaled buffer that lands in the in-memory
+	// object store back into plog.Logs and reading the attribute.
+	store := objstore.NewInMemory()
+	cfg := &Config{
+		ObjectStore: ObjectStoreConfig{
+			Type:   objectStoreTypeS3,
+			Bucket: "logs-bucket",
+			Region: "us-west-2",
+		},
+		DataPathPrefix:          "ingest/otel/logs/data",
+		ManifestPath:            "ingest/otel/logs/manifest",
+		FlushInterval:           24 * time.Hour,
+		FlushSizeBytes:          1,
+		Compression:             compressionNone,
+		UploadConcurrency:       1,
+		EncodeConcurrency:       1,
+		MaxInFlightBatches:      64,
+		MaxInFlightBytes:        256 * 1024 * 1024,
+		ManifestAppendBatchSize: 1,
+	}
+	exp := newOpenDataExporterForSignal(cfg, SignalTypeLogs)
+	exp.storeFactory = func(context.Context, ObjectStoreConfig) (objstore.ObjectStore, error) {
+		return store, nil
+	}
+	ctx := context.Background()
+	if err := exp.Start(ctx, nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = exp.Shutdown(context.Background()) })
+
+	before := time.Now().UnixNano()
+	if err := exp.ConsumeLogs(ctx, testLogs()); err != nil {
+		t.Fatalf("ConsumeLogs: %v", err)
+	}
+	after := time.Now().UnixNano()
+
+	// Read the data object that the manifest entry points at and
+	// unmarshal it back to plog.Logs.
+	manifestObj, err := store.Get(ctx, cfg.ManifestPath)
+	if err != nil {
+		t.Fatalf("get manifest: %v", err)
+	}
+	entries, err := buffer.DecodeManifestEntries(manifestObj.Data)
+	if err != nil {
+		t.Fatalf("decode manifest: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("manifest entries: got %d want 1", len(entries))
+	}
+	dataObj, err := store.Get(ctx, entries[0].Location)
+	if err != nil {
+		t.Fatalf("get data object: %v", err)
+	}
+	payloads, err := buffer.DecodeBatch(dataObj.Data)
+	if err != nil {
+		t.Fatalf("decode batch: %v", err)
+	}
+	if len(payloads) != 1 {
+		t.Fatalf("batch payloads: got %d want 1", len(payloads))
+	}
+	unmarshaler := &plog.ProtoUnmarshaler{}
+	ld, err := unmarshaler.UnmarshalLogs(payloads[0])
+	if err != nil {
+		t.Fatalf("unmarshal logs: %v", err)
+	}
+	if ld.ResourceLogs().Len() != 1 {
+		t.Fatalf("ResourceLogs after round-trip: got %d want 1", ld.ResourceLogs().Len())
+	}
+	v, ok := ld.ResourceLogs().At(0).Resource().Attributes().Get(gatewayReceivedAtAttrKey)
+	if !ok {
+		t.Fatal("ResourceLogs missing _odb_gateway_received_at after round-trip")
+	}
+	if v.Type() != pcommon.ValueTypeInt {
+		t.Fatalf("attribute type: got %v want Int", v.Type())
+	}
+	stamp := v.Int()
+	if stamp < before || stamp > after {
+		t.Errorf("stamp %d outside captured wall-clock window [%d, %d]", stamp, before, after)
+	}
+}
+
+func TestCapabilitiesMutatesData(t *testing.T) {
+	// MutatesData must be true because ConsumeLogs writes to the
+	// Resource attribute map of incoming plog.Logs. A regression to
+	// false would let future fanout configs share the pdata
+	// read-only and produce undefined behavior.
+	cfg := &Config{
+		ObjectStore: ObjectStoreConfig{
+			Type:   objectStoreTypeS3,
+			Bucket: "x",
+			Region: "us-west-2",
+		},
+	}
+	exp := newOpenDataExporterForSignal(cfg, SignalTypeLogs)
+	if !exp.Capabilities().MutatesData {
+		t.Fatal("Capabilities.MutatesData = false; want true")
+	}
 }

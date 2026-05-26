@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/exporter"
 )
 
@@ -44,6 +45,21 @@ func TestCreateDefaultConfig(t *testing.T) {
 	if cfg.Compression != compressionZstd {
 		t.Fatalf("unexpected compression: %q", cfg.Compression)
 	}
+	if cfg.UploadConcurrency < 1 {
+		t.Fatalf("default upload_concurrency must be at least 1, got %d", cfg.UploadConcurrency)
+	}
+	if cfg.EncodeConcurrency < 1 {
+		t.Fatalf("default encode_concurrency must be at least 1, got %d", cfg.EncodeConcurrency)
+	}
+	if cfg.MaxInFlightBatches < 1 {
+		t.Fatalf("default max_inflight_batches must be at least 1, got %d", cfg.MaxInFlightBatches)
+	}
+	if cfg.MaxInFlightBytes < 1 {
+		t.Fatalf("default max_inflight_bytes must be at least 1, got %d", cfg.MaxInFlightBytes)
+	}
+	if cfg.ManifestAppendBatchSize < 1 {
+		t.Fatalf("default manifest_append_batch_size must be at least 1, got %d", cfg.ManifestAppendBatchSize)
+	}
 }
 
 func TestCreateMetricsExporter(t *testing.T) {
@@ -51,7 +67,8 @@ func TestCreateMetricsExporter(t *testing.T) {
 	cfg := createDefaultConfig()
 
 	exp, err := f.CreateMetrics(context.Background(), exporter.Settings{
-		ID: component.NewID(componentType),
+		ID:                component.NewID(componentType),
+		TelemetrySettings: componenttest.NewNopTelemetrySettings(),
 	}, cfg)
 	if err != nil {
 		t.Fatalf("CreateMetrics returned error: %v", err)
@@ -66,7 +83,8 @@ func TestCreateLogsExporter(t *testing.T) {
 	cfg := createDefaultConfig()
 
 	exp, err := f.CreateLogs(context.Background(), exporter.Settings{
-		ID: component.NewID(componentType),
+		ID:                component.NewID(componentType),
+		TelemetrySettings: componenttest.NewNopTelemetrySettings(),
 	}, cfg)
 	if err != nil {
 		t.Fatalf("CreateLogs returned error: %v", err)
@@ -125,7 +143,8 @@ func TestCreateLogsExporterDoesNotMutateInputConfig(t *testing.T) {
 	originalManifest := cfg.(*Config).ManifestPath
 
 	if _, err := f.CreateLogs(context.Background(), exporter.Settings{
-		ID: component.NewID(componentType),
+		ID:                component.NewID(componentType),
+		TelemetrySettings: componenttest.NewNopTelemetrySettings(),
 	}, cfg); err != nil {
 		t.Fatalf("CreateLogs returned error: %v", err)
 	}

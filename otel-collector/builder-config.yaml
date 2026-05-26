@@ -1,7 +1,7 @@
 # OTel Collector Builder (ocb) manifest — produces a custom collector
 # binary that bundles the in-repo `opendataexporter` alongside the
-# standard OTLP receiver + batching processor surface used by the
-# Phase 8 perf-rig cell gateway.
+# standard OTLP receiver + batching processor surface used by a
+# production OTel collector deployment.
 #
 # Component versions are pinned to the v1.55.0 stable / v0.152.0
 # unstable line because that's what `exporter/opendataexporter/go.mod`
@@ -19,7 +19,7 @@
 dist:
   module: github.com/opendata-oss/opendata-go/otel-collector
   name: otelcol-opendata
-  description: OTel collector bundling the OpenData exporter for the Phase 8 perf rig.
+  description: OTel collector bundling the OpenData exporter.
   # Always relative to the cwd `builder` is invoked from. Build commands
   # (Dockerfile + README) invoke `builder` from the repo root so this
   # lands at `<repo-root>/otel-collector/_build/`. The `replaces` paths

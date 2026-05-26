@@ -99,20 +99,27 @@ func (e *openDataExporter) Start(ctx context.Context, _ component.Host) error {
 	producerConfig.ManifestPath = e.config.ManifestPath
 	producerConfig.FlushInterval = e.config.FlushInterval
 	producerConfig.FlushSizeBytes = e.config.FlushSizeBytes
+	producerConfig.UploadConcurrency = e.config.UploadConcurrency
+	producerConfig.EncodeConcurrency = e.config.EncodeConcurrency
+	producerConfig.MaxInFlightBatches = e.config.MaxInFlightBatches
+	producerConfig.MaxInFlightBytes = e.config.MaxInFlightBytes
+	producerConfig.ManifestAppendBatchSize = e.config.ManifestAppendBatchSize
 	producerConfig.BatchCompression = compression
 	producerConfig.Observer = e.telemetry
 
 	e.producer = buffer.NewProducer(store, producerConfig)
+	// Wire the producer into the telemetry's async-gauge callback so
+	// `buffer.producer.oldest_unflushed_batch_age_seconds` starts
+	// reporting non-zero values on the next OTel collection cycle.
+	e.telemetry.setProducer(e.producer)
+	// Dump the full effective Config (after factory defaults + user
+	// YAML merge) so operators can verify what's actually running.
+	// Logging the complete set surfaces silently-dropped knobs that a
+	// partial log would hide.
 	e.telemetry.logger.Info(
 		"Starting OpenData exporter",
 		zap.String("signal", signalLabel(e.signalType)),
-		zap.String("bucket", e.config.ObjectStore.Bucket),
-		zap.String("region", e.config.ObjectStore.Region),
-		zap.String("data_path_prefix", e.config.DataPathPrefix),
-		zap.String("manifest_path", e.config.ManifestPath),
-		zap.Duration("flush_interval", e.config.FlushInterval),
-		zap.Int("flush_size_bytes", e.config.FlushSizeBytes),
-		zap.String("compression", e.config.Compression),
+		zap.Any("config", e.config),
 	)
 	return nil
 }
@@ -126,11 +133,19 @@ func (e *openDataExporter) Shutdown(ctx context.Context) error {
 	if p == nil {
 		return nil
 	}
+	// Detach from the async-gauge callback before tearing down so
+	// the callback can't observe a closed producer mid-Close.
+	e.telemetry.setProducer(nil)
 	return p.Close(ctx)
 }
 
 func (e *openDataExporter) Capabilities() consumer.Capabilities {
-	return consumer.Capabilities{MutatesData: false}
+	// MutatesData is true on the logs path because ConsumeLogs stamps
+	// `_odb_gateway_received_at` onto every ResourceLogs.Resource() so
+	// the downstream ingestor can compute end-to-end latency against
+	// CH's server-side now64(9). Metrics doesn't stamp today; the bit
+	// is reported once and applies to whichever signal is configured.
+	return consumer.Capabilities{MutatesData: true}
 }
 
 func (e *openDataExporter) ConsumeMetrics(ctx context.Context, md pmetric.Metrics) error {
@@ -149,10 +164,17 @@ func (e *openDataExporter) ConsumeMetrics(ctx context.Context, md pmetric.Metric
 		e.telemetry.recordFailure(ctx, "marshal", err)
 		return err
 	}
-	e.telemetry.recordMarshal(ctx, len(buf), time.Since(marshalStart))
+	bufLen := len(buf)
+	e.telemetry.recordMarshal(ctx, bufLen, time.Since(marshalStart))
 
 	err = e.appendAndAwait(ctx, buf)
-	e.telemetry.recordDurableWaitMetrics(ctx, time.Since(start), err, metricCount, dataPointCount, len(buf))
+	// `appendAndAwait` blocks until durable. The producer has its own
+	// reference to the underlying byte slice for the duration of the
+	// pipeline; dropping our reference here lets GC reclaim the
+	// marshaled bytes as soon as the producer's encoder finishes.
+	// `len(buf)` is captured above for telemetry.
+	buf = nil
+	e.telemetry.recordDurableWaitMetrics(ctx, time.Since(start), err, metricCount, dataPointCount, bufLen)
 	return err
 }
 
@@ -162,6 +184,14 @@ func (e *openDataExporter) ConsumeLogs(ctx context.Context, ld plog.Logs) error 
 	}
 
 	start := time.Now()
+	// Stamp `_odb_gateway_received_at` on every ResourceLogs.Resource()
+	// before any further work. Per OTLP-request granularity: every
+	// ResourceLogs in this Consume call shares the same nanosecond
+	// stamp. The intra-request fanout is sub-millisecond and not the
+	// signal we want to surface; per-request keeps the storage cost at
+	// `8B × distinct OTLP requests` rather than `8B × records`.
+	stampGatewayReceivedAt(ld, time.Now().UnixNano())
+
 	logRecordCount := ld.LogRecordCount()
 	e.telemetry.recordRequestStartLogs(ctx, logRecordCount)
 
@@ -171,10 +201,12 @@ func (e *openDataExporter) ConsumeLogs(ctx context.Context, ld plog.Logs) error 
 		e.telemetry.recordFailure(ctx, "marshal", err)
 		return err
 	}
-	e.telemetry.recordMarshal(ctx, len(buf), time.Since(marshalStart))
+	bufLen := len(buf)
+	e.telemetry.recordMarshal(ctx, bufLen, time.Since(marshalStart))
 
 	err = e.appendAndAwait(ctx, buf)
-	e.telemetry.recordDurableWaitLogs(ctx, time.Since(start), err, logRecordCount, len(buf))
+	buf = nil // see ConsumeMetrics; drop the reference so GC can reclaim.
+	e.telemetry.recordDurableWaitLogs(ctx, time.Since(start), err, logRecordCount, bufLen)
 	return err
 }
 
@@ -192,6 +224,12 @@ func (e *openDataExporter) appendAndAwait(ctx context.Context, payload []byte) e
 
 	enqueueStart := time.Now()
 	handle, err := producer.Append([][]byte{payload}, e.metadata)
+	// `producer.Append` copies the slice header into the pending
+	// batch. Drop our reference so this goroutine isn't the one
+	// pinning the marshaled bytes through the durable wait — the
+	// producer's own retention is the one we control elsewhere
+	// (see buffer/producer.go).
+	payload = nil
 	e.telemetry.recordEnqueueWait(ctx, time.Since(enqueueStart))
 	if err != nil {
 		e.telemetry.recordFailure(ctx, "enqueue", err)
@@ -202,6 +240,25 @@ func (e *openDataExporter) appendAndAwait(ctx context.Context, payload []byte) e
 		return err
 	}
 	return nil
+}
+
+// gatewayReceivedAtAttrKey is the OTLP Resource attribute the gateway
+// stamps with `time.Now().UnixNano()` on each incoming OTLP logs
+// request. The contrib clickhouse-ingestor adapter extracts this
+// attribute into a typed CH `Nullable(DateTime64(9))` column (paired
+// with a server-side `_odb_clickhouse_inserted_at DEFAULT now64(9)`
+// column) so harness queries can compute end-to-end latency
+// distributions per run.
+const gatewayReceivedAtAttrKey = "_odb_gateway_received_at"
+
+// stampGatewayReceivedAt writes `stampUnixNano` as an IntValue under
+// `gatewayReceivedAtAttrKey` on every ResourceLogs.Resource() in `ld`.
+// Factored out so unit tests can drive it directly.
+func stampGatewayReceivedAt(ld plog.Logs, stampUnixNano int64) {
+	rls := ld.ResourceLogs()
+	for i := 0; i < rls.Len(); i++ {
+		rls.At(i).Resource().Attributes().PutInt(gatewayReceivedAtAttrKey, stampUnixNano)
+	}
 }
 
 func signalLabel(signalType uint8) string {
