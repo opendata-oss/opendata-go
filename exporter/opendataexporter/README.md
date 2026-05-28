@@ -2,7 +2,10 @@
 
 OpenTelemetry Collector exporter that writes OTLP payloads into an [OpenData Buffer](https://github.com/opendata-oss/opendata/tree/main/buffer) queue. Built on the pipelined producer in [`opendata-go/buffer`](../../buffer/).
 
-Two factories ship, both at alpha stability: one for OTLP logs, one for OTLP metrics. The published downstream [`clickhouse-ingestor`](https://github.com/opendata-oss/opendata-contrib/tree/main/connectors/clickhouse-ingestor) reads the **logs** Buffer and writes rows into ClickHouse; a metrics decoder and sink are not shipped yet, so a metrics-side Buffer queue accumulates entries with no downstream consumer today.
+Two factories ship: one for OTLP logs, one for OTLP metrics. There are a couple of consumers of OTLP data in Buffer:
+
+1. The [`clickhouse-ingestor`](https://github.com/opendata-oss/opendata-contrib/tree/main/connectors/clickhouse-ingestor) reads the **logs** Buffer and writes rows into ClickHouse.
+2. [Opendata Timeseries](https://www.opendata.dev/docs/timeseries/ingest) natively integrates with Buffer to ingest metrics into the timeseries database.
 
 Each named `opendata` exporter handles exactly one signal — the factory you wire into the logs pipeline is a logs exporter, the factory you wire into the metrics pipeline is a metrics exporter. To carry both signals on the same collector, define two named instances with disjoint `manifest_path` / `data_path_prefix` so the two Buffer queues stay independent.
 
@@ -11,7 +14,7 @@ Each named `opendata` exporter handles exactly one signal — the factory you wi
 For one OTLP request (logs or metrics):
 
 1. Receives OTLP from the collector pipeline (logs and metrics today).
-2. **Logs only:** stamps each `ResourceLogs.Resource()` with `_odb_gateway_received_at`, a UTC nanosecond timestamp recording when the gateway received the request. Every `ResourceLogs` in a single Consume call shares the same stamp (per-request granularity, not per-record). Downstream sinks expose it as a system column for end-to-end latency measurement; the round-trip exporter test strips it before the byte compare so payload content is unchanged. The metrics path does not stamp anything.
+2. **Logs only:** stamps each `ResourceLogs.Resource()` with `_odb_gateway_received_at`, a UTC nanosecond timestamp recording when the gateway received the request. Every `ResourceLogs` in a single Consume call shares the same stamp (per-request granularity, not per-record). The metrics path does not stamp anything.
 3. Serializes the OTLP payload as protobuf, writes it to the Buffer producer as one entry per OTLP request, and attaches the OpenData envelope `{version=1, signal_type, encoding=OTLP, reserved=0}` as the per-entry metadata. `signal_type` is `2` for logs, `1` for metrics, set at exporter construction.
 4. Returns success to the collector's pipeline only after the configured durability mode is satisfied (see "Durability" below).
 
