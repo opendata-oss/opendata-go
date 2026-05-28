@@ -25,6 +25,11 @@ go.work.sum
 bin/
 otel-collector/_build/
 
+# Local bench harness binary from `go build -o bench ./cmd/bench`.
+# Ignored so a built artifact in the worktree doesn't make every
+# bench metadata.json report dirty: true.
+/bench
+
 # Rust build output
 **/target/
 

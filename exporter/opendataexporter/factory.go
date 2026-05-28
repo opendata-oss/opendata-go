@@ -5,8 +5,12 @@ import (
 	"time"
 
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/config/configoptional"
 	"go.opentelemetry.io/collector/exporter"
+	"go.opentelemetry.io/collector/exporter/exporterhelper"
 	"go.uber.org/zap"
+
+	"github.com/opendata-oss/opendata-go/buffer"
 )
 
 // Default object-store path layout for the metrics signal. Used both as the
@@ -42,22 +46,58 @@ func createDefaultConfig() component.Config {
 		ObjectStore: ObjectStoreConfig{
 			Type: objectStoreTypeS3,
 		},
-		DataPathPrefix: defaultMetricsDataPathPrefix,
-		ManifestPath:   defaultMetricsManifestPath,
-		FlushInterval:  10 * time.Second,
-		FlushSizeBytes: defaultFlushSizeMiB,
-		Compression:    compressionZstd,
+		DataPathPrefix:          defaultMetricsDataPathPrefix,
+		ManifestPath:            defaultMetricsManifestPath,
+		FlushInterval:           10 * time.Second,
+		FlushSizeBytes:          defaultFlushSizeMiB,
+		Compression:             compressionZstd,
+		UploadConcurrency:       buffer.DefaultUploadConcurrency,
+		EncodeConcurrency:       buffer.DefaultEncodeConcurrency,
+		MaxInFlightBatches:      buffer.DefaultMaxInFlightBatches,
+		MaxInFlightBytes:        buffer.DefaultMaxInFlightBytes,
+		ManifestAppendBatchSize: buffer.DefaultManifestAppendBatchSize,
+		// Default the sending_queue to the exporterhelper standard
+		// (NumConsumers=10, QueueSize=1000, non-blocking). Without
+		// the queue, every OTel pipeline call into ConsumeLogs
+		// blocks on AwaitDurable, which serializes the receiver
+		// against the producer's batch flush cadence.
+		SendingQueue: configoptional.Some(exporterhelper.NewDefaultQueueConfig()),
 	}
 }
 
-func createMetricsExporter(_ context.Context, set exporter.Settings, cfg component.Config) (exporter.Metrics, error) {
-	return newOpenDataExporterForSignalWithTelemetry(cfg.(*Config), SignalTypeMetrics, componentTelemetrySettings{
+// timeoutOptions returns a slice of exporterhelper.Option that adds
+// WithTimeout iff the user configured a non-zero Timeout. A zero value
+// preserves exporterhelper's default 5s TimeoutConfig — i.e. no behavior
+// change unless the cell YAML opts in.
+func timeoutOptions(c *Config) []exporterhelper.Option {
+	if c.Timeout > 0 {
+		return []exporterhelper.Option{
+			exporterhelper.WithTimeout(exporterhelper.TimeoutConfig{Timeout: c.Timeout}),
+		}
+	}
+	return nil
+}
+
+func createMetricsExporter(ctx context.Context, set exporter.Settings, cfg component.Config) (exporter.Metrics, error) {
+	c := cfg.(*Config)
+	inner, err := newOpenDataExporterForSignalWithTelemetry(c, SignalTypeMetrics, componentTelemetrySettings{
 		logger:        set.Logger,
 		meterProvider: set.MeterProvider,
 	})
+	if err != nil {
+		return nil, err
+	}
+	opts := []exporterhelper.Option{
+		exporterhelper.WithStart(inner.Start),
+		exporterhelper.WithShutdown(inner.Shutdown),
+		exporterhelper.WithCapabilities(inner.Capabilities()),
+		exporterhelper.WithQueue(c.SendingQueue),
+	}
+	opts = append(opts, timeoutOptions(c)...)
+	return exporterhelper.NewMetrics(ctx, set, c, inner.ConsumeMetrics, opts...)
 }
 
-func createLogsExporter(_ context.Context, set exporter.Settings, cfg component.Config) (exporter.Logs, error) {
+func createLogsExporter(ctx context.Context, set exporter.Settings, cfg component.Config) (exporter.Logs, error) {
 	// Copy the config before mutating. The OTel Collector framework may pass
 	// the same *Config instance into both createMetricsExporter and
 	// createLogsExporter when a single named exporter is wired into multiple
@@ -65,10 +105,21 @@ func createLogsExporter(_ context.Context, set exporter.Settings, cfg component.
 	// after a logs exporter would inherit the logs-flavored paths.
 	local := *(cfg.(*Config))
 	applyLogsPathDefaults(&local, set.Logger)
-	return newOpenDataExporterForSignalWithTelemetry(&local, SignalTypeLogs, componentTelemetrySettings{
+	inner, err := newOpenDataExporterForSignalWithTelemetry(&local, SignalTypeLogs, componentTelemetrySettings{
 		logger:        set.Logger,
 		meterProvider: set.MeterProvider,
 	})
+	if err != nil {
+		return nil, err
+	}
+	opts := []exporterhelper.Option{
+		exporterhelper.WithStart(inner.Start),
+		exporterhelper.WithShutdown(inner.Shutdown),
+		exporterhelper.WithCapabilities(inner.Capabilities()),
+		exporterhelper.WithQueue(local.SendingQueue),
+	}
+	opts = append(opts, timeoutOptions(&local)...)
+	return exporterhelper.NewLogs(ctx, set, &local, inner.ConsumeLogs, opts...)
 }
 
 // applyLogsPathDefaults swaps the metrics-flavored default DataPathPrefix and
