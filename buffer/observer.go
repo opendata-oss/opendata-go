@@ -28,6 +28,7 @@ type FlushStats struct {
 // `buffer.producer.queue_depth` labeling.
 type PipelineStage string
 
+// Pipeline stages, in producer order.
 const (
 	StageAppend  PipelineStage = "append"
 	StageRotate  PipelineStage = "rotate"
@@ -41,6 +42,7 @@ const (
 // per-batch terminal state.
 type BatchOutcome string
 
+// Per-batch terminal outcomes.
 const (
 	OutcomeCommitted      BatchOutcome = "committed"
 	OutcomeEncodeFailed   BatchOutcome = "encode_failed"

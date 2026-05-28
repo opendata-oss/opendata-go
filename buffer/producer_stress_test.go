@@ -216,9 +216,9 @@ func (s *choreographableStore) casCalls() int64 {
 }
 
 // waitForObserved blocks until all paths starting with `prefix` are
-// observed in Put. Returns false on timeout.
-func (s *choreographableStore) waitForObserved(prefix string, count int, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
+// observed in Put. Returns false after a 5s timeout.
+func (s *choreographableStore) waitForObserved(prefix string, count int) bool {
+	deadline := time.Now().Add(5 * time.Second)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for {
@@ -314,7 +314,7 @@ func TestProducer_uploads_complete_out_of_order(t *testing.T) {
 
 	// Wait for all n PUTs to be queued (each blocks inside Put
 	// awaiting release).
-	if !store.waitForObserved(prefix, n, 5*time.Second) {
+	if !store.waitForObserved(prefix, n) {
 		t.Fatalf("only %d of %d PUTs observed within 5s", len(store.observedPaths()), n)
 	}
 
@@ -619,7 +619,7 @@ func TestProducer_Close_canceled_ctx_returns_quickly(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 	prefix := cfg.DataPathPrefix + "/" + p.runID + "/"
-	if !store.waitForObserved(prefix, 1, 5*time.Second) {
+	if !store.waitForObserved(prefix, 1) {
 		t.Fatalf("PUT never observed at gate")
 	}
 
@@ -688,7 +688,7 @@ func TestProducer_byte_budget_blocks_AppendContext_until_release(t *testing.T) {
 	// confirms the reservation has propagated through the pipeline
 	// and the budget is held until release.
 	prefix := cfg.DataPathPrefix + "/" + p.runID + "/"
-	if !store.waitForObserved(prefix, 1, 5*time.Second) {
+	if !store.waitForObserved(prefix, 1) {
 		t.Fatalf("first PUT never observed within 5s")
 	}
 
@@ -730,7 +730,7 @@ func TestProducer_byte_budget_blocks_AppendContext_until_release(t *testing.T) {
 		}
 		// Release its PUT too so the test's deferred Close() can
 		// drain cleanly.
-		if !store.waitForObserved(prefix, 2, 5*time.Second) {
+		if !store.waitForObserved(prefix, 2) {
 			t.Fatalf("second PUT never observed")
 		}
 		paths = store.observedPaths()
@@ -765,7 +765,7 @@ func TestProducer_byte_budget_AppendContext_returns_ctx_err_on_cancel(t *testing
 		t.Fatalf("first Append: %v", err)
 	}
 	prefix := cfg.DataPathPrefix + "/" + p.runID + "/"
-	if !store.waitForObserved(prefix, 1, 5*time.Second) {
+	if !store.waitForObserved(prefix, 1) {
 		t.Fatalf("first PUT never observed")
 	}
 
@@ -790,7 +790,7 @@ func TestProducer_byte_budget_AppendContext_returns_ctx_err_on_cancel(t *testing
 	if err != nil {
 		t.Fatalf("post-release AppendContext: %v", err)
 	}
-	if !store.waitForObserved(prefix, 2, 5*time.Second) {
+	if !store.waitForObserved(prefix, 2) {
 		t.Fatalf("second PUT never observed")
 	}
 	paths = store.observedPaths()
@@ -849,7 +849,7 @@ func TestProducer_manifest_commit_coalesces_in_order_under_slow_first_CAS(t *tes
 	}
 
 	// Wait until all n PUTs are observed at the choreography gate.
-	if !store.waitForObserved(prefix, n, 5*time.Second) {
+	if !store.waitForObserved(prefix, n) {
 		t.Fatalf("only %d of %d PUTs observed within 5s", len(store.observedPaths()), n)
 	}
 	paths := store.observedPaths()
@@ -949,7 +949,7 @@ func TestProducer_Flush_waits_for_in_flight_size_triggered_batch(t *testing.T) {
 
 	// Wait for the size-triggered batch to reach the uploader, where
 	// the choreographable store parks it on Put.
-	if !store.waitForObserved(prefix, 1, 5*time.Second) {
+	if !store.waitForObserved(prefix, 1) {
 		t.Fatalf("PUT never observed; the size-triggered batch did not reach the uploader")
 	}
 
@@ -1071,16 +1071,6 @@ func (o *recordingObserver) maxInflightBatches() int {
 	return m
 }
 
-func (o *recordingObserver) outcomeCounts() map[BatchOutcome]int {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	out := map[BatchOutcome]int{}
-	for _, o2 := range o.batchOutcomes {
-		out[o2]++
-	}
-	return out
-}
-
 func (o *recordingObserver) queueDepthStages() []PipelineStage {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -1119,7 +1109,7 @@ func TestProducer_inflight_gauges_emit_on_acquire(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 
-	if !store.waitForObserved(prefix, 1, 5*time.Second) {
+	if !store.waitForObserved(prefix, 1) {
 		t.Fatalf("PUT never observed; the size-triggered batch did not reach the uploader")
 	}
 
@@ -1175,7 +1165,7 @@ func TestProducer_byte_budget_charges_framing_overhead(t *testing.T) {
 	}()
 
 	prefix := cfg.DataPathPrefix + "/" + p.runID + "/"
-	if !store.waitForObserved(prefix, 1, 5*time.Second) {
+	if !store.waitForObserved(prefix, 1) {
 		t.Fatalf("PUT never observed; rotation did not reach the uploader")
 	}
 

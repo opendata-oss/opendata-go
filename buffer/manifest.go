@@ -306,12 +306,6 @@ type enqueueItem struct {
 	Metadata []QueueMetadata
 }
 
-// enqueue appends a single queue entry. Backwards-compatible wrapper
-// over enqueueBatch.
-func (p *manifestEnqueuer) enqueue(ctx context.Context, location string, metadata []QueueMetadata) (int, error) {
-	return p.enqueueBatch(ctx, []enqueueItem{{Location: location, Metadata: metadata}})
-}
-
 // enqueueBatch appends N queue entries to the manifest in **one** CAS
 // round trip, retrying automatically on optimistic concurrency
 // conflicts. All items succeed together or none do — there is no
