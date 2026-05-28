@@ -168,12 +168,8 @@ func (e *openDataExporter) ConsumeMetrics(ctx context.Context, md pmetric.Metric
 	e.telemetry.recordMarshal(ctx, bufLen, time.Since(marshalStart))
 
 	err = e.appendAndAwait(ctx, buf)
-	// `appendAndAwait` blocks until durable. The producer has its own
-	// reference to the underlying byte slice for the duration of the
-	// pipeline; dropping our reference here lets GC reclaim the
-	// marshaled bytes as soon as the producer's encoder finishes.
-	// `len(buf)` is captured above for telemetry.
-	buf = nil
+	// `appendAndAwait` blocks until durable; `bufLen` was captured
+	// above for telemetry.
 	e.telemetry.recordDurableWaitMetrics(ctx, time.Since(start), err, metricCount, dataPointCount, bufLen)
 	return err
 }
@@ -205,7 +201,6 @@ func (e *openDataExporter) ConsumeLogs(ctx context.Context, ld plog.Logs) error 
 	e.telemetry.recordMarshal(ctx, bufLen, time.Since(marshalStart))
 
 	err = e.appendAndAwait(ctx, buf)
-	buf = nil // see ConsumeMetrics; drop the reference so GC can reclaim.
 	e.telemetry.recordDurableWaitLogs(ctx, time.Since(start), err, logRecordCount, bufLen)
 	return err
 }
@@ -224,12 +219,6 @@ func (e *openDataExporter) appendAndAwait(ctx context.Context, payload []byte) e
 
 	enqueueStart := time.Now()
 	handle, err := producer.Append([][]byte{payload}, e.metadata)
-	// `producer.Append` copies the slice header into the pending
-	// batch. Drop our reference so this goroutine isn't the one
-	// pinning the marshaled bytes through the durable wait — the
-	// producer's own retention is the one we control elsewhere
-	// (see buffer/producer.go).
-	payload = nil
 	e.telemetry.recordEnqueueWait(ctx, time.Since(enqueueStart))
 	if err != nil {
 		e.telemetry.recordFailure(ctx, "enqueue", err)

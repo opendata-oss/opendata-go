@@ -748,6 +748,26 @@ func verifyExportedLogs(t *testing.T, client *s3.Client, bucket, manifestPath, d
 		t.Fatalf("unmarshal round-tripped logs: %v", err)
 	}
 
+	// The exporter stamps `_odb_gateway_received_at` (gateway-receive
+	// time, in nanos) onto every ResourceLogs.Resource() before
+	// storing. Assert it's present and plausible, then strip it so the
+	// remaining payload can be compared byte-for-byte against the input.
+	const gatewayReceivedAtAttrKey = "_odb_gateway_received_at"
+	nowNanos := time.Now().UnixNano()
+	rls := roundTripped.ResourceLogs()
+	for i := 0; i < rls.Len(); i++ {
+		attrs := rls.At(i).Resource().Attributes()
+		v, ok := attrs.Get(gatewayReceivedAtAttrKey)
+		if !ok {
+			t.Fatalf("resource logs[%d] missing %s stamp", i, gatewayReceivedAtAttrKey)
+		}
+		if stamp := v.Int(); stamp <= 0 || stamp > nowNanos {
+			t.Fatalf("resource logs[%d] %s = %d, want positive nanos <= now (%d)",
+				i, gatewayReceivedAtAttrKey, stamp, nowNanos)
+		}
+		attrs.Remove(gatewayReceivedAtAttrKey)
+	}
+
 	marshaler := &plog.ProtoMarshaler{}
 	originalBytes, err := marshaler.MarshalLogs(original)
 	if err != nil {
