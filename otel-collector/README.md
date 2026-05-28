@@ -4,6 +4,14 @@ A production OTel collector deployment needs the in-repo
 `opendataexporter`. Stock `otelcol-contrib` doesn't include it;
 this directory bakes a custom collector binary instead.
 
+## Pull the published image
+
+```sh
+docker pull ghcr.io/opendata-oss/otel-collector:v0.4.0-04f46c2
+```
+
+Built from the `v0.4.0` root-module tag (commit `04f46c2`). The image is publicly readable; no auth needed for pull. Until the workflow gains semver tag aliases, the only published tag for a release is `<ref>-<sha>`. Pin the exact one you ran.
+
 ## Build locally
 
 ```
