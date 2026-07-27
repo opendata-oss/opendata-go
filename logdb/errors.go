@@ -19,6 +19,14 @@ var (
 	// ErrServerError indicates a server-side failure (HTTP 5xx), typically a
 	// storage or encoding error.
 	ErrServerError = errors.New("server error")
+
+	// ErrNotReady indicates the readiness probe failed (HTTP 503): the server
+	// is running but cannot reach its storage backend.
+	//
+	// It wraps ErrServerError so both readings work off one error: code polling
+	// for readiness tests for ErrNotReady, while code that only cares that the
+	// remote side failed tests for ErrServerError.
+	ErrNotReady = fmt.Errorf("%w: not ready", ErrServerError)
 )
 
 // APIError is returned for any response the server does not answer with 200.
@@ -45,6 +53,8 @@ func (e *APIError) Unwrap() error {
 	switch {
 	case e.StatusCode == http.StatusNotFound:
 		return ErrNotFound
+	case e.StatusCode == http.StatusServiceUnavailable:
+		return ErrNotReady
 	case e.StatusCode >= 500:
 		return ErrServerError
 	case e.StatusCode >= 400:
