@@ -6,6 +6,7 @@ This repository contains a root Go module plus a nested exporter module at `expo
 
 Key areas:
 - `buffer`: batching, durability, manifest enqueueing
+- `logdb`: HTTP client for the Log service (append, scan, listings, tail follower)
 - `objstore`: object storage abstractions and implementations
 - `exporter/opendataexporter`: OpenTelemetry Collector exporter module
 - `test/compat-producer`: compatibility test helper
@@ -51,9 +52,19 @@ Run exporter e2e tests:
 make exporter-e2e
 ```
 
+Run `logdb` integration tests against a real Log server:
+
+```sh
+make logdb-integration
+```
+
 Notes:
 - Exporter e2e tests require Docker.
 - The e2e path builds a custom collector binary and can take noticeable time.
+- `logdb` integration tests require Docker; they start `ghcr.io/opendata-oss/log`.
+  Set `LOGDB_BASE_URL` to test against an already-running server instead, or
+  `LOGDB_LOG_IMAGE` to pin a different image. They are behind the `integration`
+  build tag, so `make test` does not run them.
 
 ## Lint
 
@@ -64,7 +75,7 @@ Working lint commands:
 ```sh
 GOCACHE=/tmp/opendata-go-lint/root-go-build \
 GOLANGCI_LINT_CACHE=/tmp/opendata-go-lint/root-golangci-lint \
-golangci-lint run ./buffer ./objstore ./test/compat-producer
+golangci-lint run ./buffer ./logdb ./objstore ./test/compat-producer
 ```
 
 ```sh

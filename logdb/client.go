@@ -1,4 +1,3 @@
-// Package logdb is a client for the OpenData Log HTTP API.
 package logdb
 
 import (
