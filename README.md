@@ -3,13 +3,14 @@
 [![Discord](https://img.shields.io/badge/discord-join-7289DA?style=flat-square&logo=discord)](https://discord.gg/CsAQJ2AJGU)
 [![GitHub License](https://img.shields.io/github/license/opendata-oss/opendata?style=flat-square)](LICENSE)
 
-Go bindings for the [OpenData](https://github.com/opendata-oss/opendata) project. Producer for [OpenData Buffer](https://github.com/opendata-oss/opendata/tree/main/buffer), an OTel collector exporter built on it, and the object-store adapters they share.
+Go bindings for the [OpenData](https://github.com/opendata-oss/opendata) project. Producer for [OpenData Buffer](https://github.com/opendata-oss/opendata/tree/main/buffer), a client for [OpenData Log](https://github.com/opendata-oss/opendata/tree/main/log), an OTel collector exporter built on the producer, and the object-store adapters they share.
 
 ## Packages
 
 | Package | Description |
 |---|---|
 | [`buffer`](buffer/) | Pipelined Buffer producer: concurrent encode + upload, manifest-append batching, byte-budgeted backpressure, lifecycle observer |
+| [`logdb`](logdb/) | Log HTTP API client: append, scan, count, listings, and a tail follower that tracks the resume cursor |
 | [`objstore`](objstore/) | Object-store abstraction with S3 and in-memory implementations |
 | [`exporter/opendataexporter`](exporter/opendataexporter/) | OTel collector exporter that writes to a Buffer queue via the producer |
 | [`otel-collector`](otel-collector/) | Custom OTel collector distribution that bundles the exporter |
@@ -74,6 +75,37 @@ The OTel exporter ships an `Observer` that emits the standard `buffer.producer.*
 The OTel exporter is the right choice if you are already running an OTel collector. It is a normal collector exporter; configure it in your collector config and the producer runs inside the collector process.
 
 Use the Go producer directly when you control the source side and want to push raw bytes into Buffer without an OTel collector hop: a service writing its own custom protobuf, a load generator, an integration test. `cmd/bench` is the worked example.
+
+## Log client
+
+[`logdb`](logdb/) talks to a running [Log](https://github.com/opendata-oss/opendata/tree/main/log) server over its HTTP API. Standard library only.
+
+```go
+c, err := logdb.New("http://localhost:8080")
+
+_, err = c.Append(ctx, []logdb.Record{
+	{Key: []byte("orders"), Value: []byte("order-1")},
+}, logdb.AppendOptions{})
+
+// Tail the stream. Follower tracks the RFC 0007 resume cursor, so idle polling
+// costs O(new data) rather than O(backlog).
+f := c.Follow("orders", logdb.FollowOptions{Limit: 500})
+for {
+	entries, err := f.Next(ctx)   // empty result = nothing new yet, not an error
+	if err != nil {
+		return err
+	}
+	handle(entries)
+}
+```
+
+Two things to know going in: `Append` takes arbitrary bytes for a key, but `Scan` and `Count` pass the key as a query parameter and so require valid UTF-8, meaning a binary key can be written and never read back. And unset options are omitted rather than defaulted client-side, so a `Scan` without `Limit` returns the server's 32 entries. See the [package documentation](logdb/) for the full set, including where the server diverges from RFC 0004 and the published OpenAPI spec.
+
+Integration tests run against the real server image:
+
+```sh
+make logdb-integration   # requires docker; or set LOGDB_BASE_URL
+```
 
 ## Releases
 
